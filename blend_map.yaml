@@ -1,0 +1,38 @@
+# Default configuration for skin retouching model training
+
+# Dataset configuration
+data_root: "/workspace/double_chin/double_chin_data_v3"
+data_json: "/workspace/double_chin/double_chin_data_v3/data_v3_data_final.json"
+
+# Training parameters
+num_epochs: 200
+batch_size: 4
+learning_rate: 0.0001
+img_size: 1024
+num_workers: 8
+
+# Loss weights
+lambda_blend_mse: 1.0
+lambda_image_mse: 1.0
+lambda_perc: 0.1
+lambda_tv: 0.1
+
+# Learning rate scheduler
+lr_step_size: 50
+lr_gamma: 0.1
+
+# Checkpoint settings
+save_dir: 'weights-blend-maps/'
+pretrained_path: 'weights-blend-maps/blend_maps_v3_2/double_chin_bmap_epoch_106.pth'      # Path to pretrained model (empty for training from scratch)
+save_interval: 1         # Save checkpoint every N epochs
+start_epoch: 106           # Starting epoch (useful for resuming training)
+
+# Distributed training
+port: 12350
+
+# Weights & Biases logging
+test: false
+use_wandb: true
+entity_name: 'aka-vm'    # Your wandb username/entity
+project_name: 'blend_maps_v3_2'  # Your wandb project name
+# project_name: 'double-chin-warp-maps-half_cv2_flow'  # Your wandb project name
