@@ -11,10 +11,12 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
-import wandb
+import mlflow
 import sys
 import datetime
 import time
+import random
+import numpy as np
 
 # Add the parent directory to the path so we can import from src
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -193,6 +195,15 @@ def train_skin_retouching_model(local_rank, world_size, args):
     """
     print(f"Process {local_rank}: Starting initialization")
     
+    # Reproducibility
+    seed = args.get('seed', 42)
+    random.seed(seed + local_rank)
+    np.random.seed(seed + local_rank)
+    torch.manual_seed(seed + local_rank)
+    torch.cuda.manual_seed_all(seed + local_rank)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
     # Set environment variables for debugging
     os.environ['TORCH_DISTRIBUTED_DEBUG'] = 'DETAIL'
     
@@ -201,13 +212,15 @@ def train_skin_retouching_model(local_rank, world_size, args):
     torch.cuda.set_device(local_rank)
     print(f"Process {local_rank}: Set device to {device}")
     
-    # Initialize wandb for the main process
-    if local_rank == 0 and args.get('use_wandb', True):
-        wandb.init(
-            project=args['project_name'],
-            entity=args['entity_name'],
-            config=args
-        )
+    # Initialize MLflow for the main process
+    if local_rank == 0 and args.get('use_mlflow', True):
+        mlflow.set_tracking_uri(args.get('mlflow_tracking_uri', 'mlruns'))
+        mlflow.set_experiment(args['project_name'])
+        mlflow.start_run(run_name=args.get('run_name', None))
+        mlflow.log_params({
+            k: v for k, v in args.items()
+            if isinstance(v, (str, int, float, bool))
+        })
     
     print(f"Process {local_rank}: Creating data loaders")
     # Create data loaders
@@ -291,19 +304,17 @@ def train_skin_retouching_model(local_rank, world_size, args):
         )
         
         # Log training results
-        if local_rank == 0 and args.get('use_wandb', True):
-            wandb_log = {
-                'train_loss': train_losses['total_loss'],
-                'train_blend_map_loss': train_losses['blend_map_loss'],
-                'train_image_mse_loss': train_losses['image_mse_loss'],
-                'train_perc_loss': train_losses['perc_loss'],
-                'train_tv_loss': train_losses['tv_loss'],
-                'epoch': epoch + 1,
-                'lr': optimizer.param_groups[0]['lr']
-            }
-            wandb.log(wandb_log)
-            
+        if local_rank == 0:
             print(f"\nEpoch [{epoch + 1}/{num_epochs}], Training Loss: {train_losses['total_loss']:.4f}")
+            if args.get('use_mlflow', True):
+                mlflow.log_metrics({
+                    'train_loss': train_losses['total_loss'],
+                    'train_blend_map_loss': train_losses['blend_map_loss'],
+                    'train_image_mse_loss': train_losses['image_mse_loss'],
+                    'train_perc_loss': train_losses['perc_loss'],
+                    'train_tv_loss': train_losses['tv_loss'],
+                    'lr': optimizer.param_groups[0]['lr'],
+                }, step=epoch + 1)
         
         # Validate
         test_results = validate(
@@ -317,17 +328,15 @@ def train_skin_retouching_model(local_rank, world_size, args):
             print(f"Average Testing Loss: {test_results['total_loss']:.4f}")
             print(f"Average PSNR: {test_results['psnr']:.2f} dB")
             
-            if args.get('use_wandb', True):
-                wandb_log = {
+            if args.get('use_mlflow', True):
+                mlflow.log_metrics({
                     'test_loss': test_results['total_loss'],
                     'test_blend_map_loss': test_results['blend_map_loss'],
                     'test_image_mse_loss': test_results['image_mse_loss'],
                     'test_perc_loss': test_results['perc_loss'],
                     'test_tv_loss': test_results['tv_loss'],
                     'test_psnr': test_results['psnr'],
-                    'epoch': epoch + 1
-                }
-                wandb.log(wandb_log)
+                }, step=epoch + 1)
             
             # Save best model
             if test_results['total_loss'] < best_test_loss:
@@ -356,8 +365,9 @@ def train_skin_retouching_model(local_rank, world_size, args):
         print(f"Best model was from epoch {best_epoch} with test loss: {best_test_loss:.4f}")
         print(f"Final model saved as '{save_dir}/double_chin_bmap_final.pth'")
         
-        if args.get('use_wandb', True):
-            wandb.finish()
+        if args.get('use_mlflow', True):
+            mlflow.log_artifact(f'{save_dir}/double_chin_bmap_best.pth')
+            mlflow.end_run()
 
 
 def main_worker(local_rank, world_size, args):
@@ -404,7 +414,7 @@ def load_config(config_path='blend_map.yaml'):
         config = yaml.safe_load(f)
 
     if config.get('test', False):    
-        config['use_wandb'] = False
+        config['use_mlflow'] = False
         config['test'] = True
         config['project_name'] = config['project_name']+'_test'
         config['save_dir'] = config['save_dir']+'_test'

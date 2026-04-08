@@ -58,17 +58,31 @@ class BlendMapDataset(Dataset):
         self.transform = transform
         self.resize_dim = resize_dim
 
+        data_map = json.load(open(data_json))
+
+        # Filter BEFORE test-slicing so we don't accidentally get all-excluded entries
+        data_map = [data for data in data_map if data["source"] != "aadan_double_chin"]
+
         if test:
-            data_map = json.load(open(data_json))[:100]
-        else:
-            data_map = json.load(open(data_json))
+            data_map = data_map[:100]
 
         for data_item in data_map:
             if self.BLEND_MAP_IMAGE not in data_item:
-                bmap_path = data_item[self.GT_IMAGE].replace(self.GT_IMAGE, self.BLEND_MAP_IMAGE)
+                gt_path = data_item[self.GT_IMAGE]
+                # Replace "edited" or "edited_image" directory with "blendmap_image"
+                bmap_path = (
+                    gt_path
+                    .replace("/edited_image/", "/blendmap_image/")
+                    .replace("/edited/", "/blendmap_image/")
+                )
                 data_item[self.BLEND_MAP_IMAGE] = os.path.splitext(bmap_path)[0] + '.npy'
-        os.makedirs(os.path.join(self.data_root, self.BLEND_MAP_IMAGE), exist_ok=True)
-        data_map = [data for data in data_map if data["source"] != "aadan_double_chin"]
+
+        # Ensure the blend-map cache directory exists
+        if data_map:
+            sample_bmap_dir = os.path.dirname(
+                os.path.join(self.data_root, data_map[0][self.BLEND_MAP_IMAGE])
+            )
+            os.makedirs(sample_bmap_dir, exist_ok=True)
         print(f"Length of data_map: {len(data_map)}")
         self.data_map = data_map
 
@@ -105,6 +119,7 @@ class BlendMapDataset(Dataset):
                 blend_map = cv2.resize(blend_map, self.resize_dim)
             else:
                 blend_map = compute_target_blend_map_np(image, gt)
+                os.makedirs(os.path.dirname(blend_map_path), exist_ok=True)
                 np.save(blend_map_path, blend_map.astype(np.float16))
 
             # Normalize
@@ -313,10 +328,11 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
     else:
         raise ValueError(f"Invalid dataset type: {dataset_type}")
     
-    # Split dataset into train and test
+    # Split dataset into train and test (seeded for reproducibility)
     train_size = int(len(dataset) * 0.9)
     test_size = len(dataset) - train_size
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+    split_gen = torch.Generator().manual_seed(args.get("seed", 42))
+    train_dataset, test_dataset = random_split(dataset, [train_size, test_size], generator=split_gen)
     
     # Create samplers for distributed training if world_size and rank are provided
     if world_size is not None and rank is not None:

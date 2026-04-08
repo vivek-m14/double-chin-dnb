@@ -1,8 +1,11 @@
 # Default configuration for skin retouching model training
 
 # Dataset configuration
-data_root: "/workspace/double_chin_data_v3"
+data_root: "/workspace"
 data_json: "/workspace/double_chin_data_v3/data_v3_data_final.json"
+
+# Reproducibility
+seed: 42
 
 # Training parameters
 num_epochs: 200
