@@ -420,7 +420,7 @@ def main_worker(local_rank, world_size, args):
     # Initialize process group with timeout
     try:
         dist.init_process_group(
-            backend='gloo',  # Use gloo backend instead of nccl
+            backend='nccl',  # Use nccl for multi-GPU CUDA training
             init_method=f'tcp://localhost:{args["port"]}',
             world_size=world_size,
             rank=local_rank,
@@ -487,6 +487,7 @@ def main():
     print(f"Save directory: {config['save_dir']}")
     
     try:
+        mp.set_start_method('spawn', force=True)
         mp.spawn(main_worker, nprocs=world_size, args=(world_size, config))
     except Exception as e:
         print(f"Training failed: {e}")
