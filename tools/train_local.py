@@ -223,11 +223,19 @@ def train(args: dict):
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.get("learning_rate", 1e-4))
-    scheduler = StepLR(
-        optimizer,
-        step_size=args.get("lr_step_size", 50),
-        gamma=args.get("lr_gamma", 0.1),
-    )
+    scheduler_type = args.get("lr_scheduler", "step")
+    if scheduler_type == "cosine":
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=args.get("num_epochs", 10),
+            eta_min=args.get("lr_min", 1e-6),
+        )
+    else:
+        scheduler = StepLR(
+            optimizer,
+            step_size=args.get("lr_step_size", 50),
+            gamma=args.get("lr_gamma", 0.1),
+        )
 
     # ── Resume from full checkpoint ──
     best_val_loss = float("inf")

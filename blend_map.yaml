@@ -8,8 +8,8 @@ data_json: "/workspace/double_chin_data_v3/data_v3_data_final.json"
 seed: 42
 
 # Training parameters
-num_epochs: 200
-batch_size: 4
+num_epochs: 150
+batch_size: 8
 learning_rate: 0.0001
 img_size: 1024
 num_workers: 8
@@ -21,14 +21,16 @@ lambda_perc: 0.1
 lambda_tv: 0.1
 
 # Learning rate scheduler
-lr_step_size: 50
-lr_gamma: 0.1
+lr_scheduler: 'cosine'   # 'cosine' (CosineAnnealingLR) or 'step' (StepLR)
+lr_step_size: 50          # only used if lr_scheduler=step
+lr_gamma: 0.1             # only used if lr_scheduler=step
+lr_min: 1.0e-6            # only used if lr_scheduler=cosine
 
 # Checkpoint settings
 save_dir: 'weights-blend-maps/'
 pretrained_path: ''      # Path to pretrained model (empty for training from scratch)
 resume_path: ''          # Path to full checkpoint to resume training (includes optimizer/scheduler/epoch)
-save_interval: 1         # Save checkpoint every N epochs
+save_interval: 5         # Save checkpoint every N epochs
 start_epoch: 0           # Starting epoch (useful for resuming training)
 
 # Distributed training

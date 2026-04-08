@@ -9,7 +9,7 @@ import torch.optim as optim
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.optim.lr_scheduler import StepLR
+from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
 from tqdm import tqdm
 import mlflow
 import sys
@@ -271,11 +271,19 @@ def train_skin_retouching_model(local_rank, world_size, args):
     
     # Create optimizer and scheduler
     optimizer = optim.Adam(model.parameters(), lr=args.get('learning_rate', 0.0001))
-    scheduler = StepLR(
-        optimizer, 
-        step_size=args.get('lr_step_size', 50), 
-        gamma=args.get('lr_gamma', 0.1)
-    )
+    scheduler_type = args.get('lr_scheduler', 'step')
+    if scheduler_type == 'cosine':
+        scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max=args.get('num_epochs', 100),
+            eta_min=args.get('lr_min', 1e-6),
+        )
+    else:
+        scheduler = StepLR(
+            optimizer, 
+            step_size=args.get('lr_step_size', 50), 
+            gamma=args.get('lr_gamma', 0.1)
+        )
     
     # Resume from full checkpoint if provided
     best_test_loss = float('inf')
