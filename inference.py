@@ -26,12 +26,19 @@ from models.unet import BaseUNetHalf
 def load_checkpoint(model, checkpoint_path):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
     elif 'state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['state_dict'])
+        state_dict = checkpoint['state_dict']
     else:
-        raise ValueError(f"Checkpoint file {checkpoint_path} does not contain 'model_state_dict' or 'state_dict'")
-    
+        # Assume the checkpoint is directly the state dict
+        state_dict = checkpoint
+
+    # Strip 'module.' prefix from DDP-saved checkpoints
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        new_state_dict[k[7:] if k.startswith('module.') else k] = v
+
+    model.load_state_dict(new_state_dict)
     return model
 
 class DoubleChinRemover:
@@ -191,38 +198,38 @@ def main():
     
     args = parser.parse_args()
 
-    
-    # Initialize inference
-    inference = DoubleChinInference(
+    # Load input image (BGR -> RGB)
+    image_bgr = cv2.imread(args.input)
+    if image_bgr is None:
+        print(f"Error: Could not read image at {args.input}")
+        sys.exit(1)
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+
+    # Initialize model
+    remover = DoubleChinRemover(
         model_path=args.model,
         device=args.device,
         img_size=args.img_size
     )
-    
+
     # Run inference
     try:
-        retouched_img, blend_map = inference.run_inference(args.input)
-        inference.save(retouched_img, args.output, args.save_flow, blend_map)
+        retouched_img, blend_map = run_inference(remover, image_rgb)
+        os.makedirs(os.path.dirname(args.output) or '.', exist_ok=True)
+        save_img(retouched_img, args.output)
+        print(f"Saved retouched image to {args.output}")
+
+        if args.save_flow:
+            blend_path = str(Path(args.output).with_suffix('')) + '_blend_map.png'
+            save_img((blend_map * 255).astype(np.uint8), blend_path)
+            print(f"Saved blend map to {blend_path}")
+
         print("Inference completed successfully!")
-        
+
     except Exception as e:
         print(f"Error during inference: {e}")
         sys.exit(1)
 
 
 if __name__ == "__main__":
-    model_weight = "weights-blend-maps/blend_maps_v2_5k/double_chin_bmap_best.pth"
-
-    input_image = "double_chin_5k/original/0a9d2e3f-97da-4ce4-aba8-d64d3f411716_0.jpg"
-    input_image = cv2.imread(input_image)
-    input_image = cv2.cvtColor(input_image, cv2.COLOR_BGR2RGB)
-
-    double_chin_remover = DoubleChinRemover(
-        model_path=model_weight,
-        device="cpu",
-        img_size=1024
-    )
-
-    retouched_img, blend_map = run_inference(double_chin_remover, input_image)
-    save_img(retouched_img, "double_chin_removed.png")
-    save_img(blend_map * 255, "blend_map.png")
+    main()
