@@ -4,6 +4,74 @@ import cv2
 import numpy as np
 
 
+def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss, is_ddp=False):
+    """
+    Save a full training checkpoint for resumable training.
+
+    Args:
+        path: File path to save the checkpoint
+        model: PyTorch model (or DDP-wrapped model)
+        optimizer: Optimizer
+        scheduler: LR scheduler
+        epoch: Current epoch (0-based, the epoch that just finished)
+        best_val_loss: Best validation loss so far
+        is_ddp: Whether the model is wrapped in DDP (will save module.state_dict)
+    """
+    state_dict = model.module.state_dict() if is_ddp else model.state_dict()
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': state_dict,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+    }, path)
+
+
+def load_full_checkpoint(path, model, optimizer=None, scheduler=None, device='cpu'):
+    """
+    Load a full training checkpoint for resuming training.
+
+    Args:
+        path: File path to the checkpoint
+        model: PyTorch model (must be un-wrapped, i.e. before DDP wrapping)
+        optimizer: Optimizer (optional — skipped if None)
+        scheduler: LR scheduler (optional — skipped if None)
+        device: Device to map tensors to
+
+    Returns:
+        dict with keys: model, optimizer, scheduler, epoch (next epoch to run),
+        best_val_loss
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Checkpoint not found: {path}")
+
+    ckpt = torch.load(path, map_location=device)
+
+    # Load model weights (strip DDP 'module.' prefix if present)
+    state_dict = ckpt['model_state_dict']
+    clean = {}
+    for k, v in state_dict.items():
+        clean[k.removeprefix('module.')] = v
+    model.load_state_dict(clean)
+
+    if optimizer is not None and 'optimizer_state_dict' in ckpt:
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    if scheduler is not None and 'scheduler_state_dict' in ckpt:
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+
+    start_epoch = ckpt.get('epoch', -1) + 1  # next epoch to run
+    best_val_loss = ckpt.get('best_val_loss', float('inf'))
+
+    print(f"Resumed from {path} (epoch {ckpt.get('epoch', '?')}, best_val_loss={best_val_loss:.4f})")
+    return {
+        'model': model,
+        'optimizer': optimizer,
+        'scheduler': scheduler,
+        'start_epoch': start_epoch,
+        'best_val_loss': best_val_loss,
+    }
+
+
 def load_checkpoint(model, checkpoint_path):
     """
     Load model weights from checkpoint file.

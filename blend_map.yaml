@@ -27,6 +27,7 @@ lr_gamma: 0.1
 # Checkpoint settings
 save_dir: 'weights-blend-maps/'
 pretrained_path: ''      # Path to pretrained model (empty for training from scratch)
+resume_path: ''          # Path to full checkpoint to resume training (includes optimizer/scheduler/epoch)
 save_interval: 1         # Save checkpoint every N epochs
 start_epoch: 0           # Starting epoch (useful for resuming training)
 

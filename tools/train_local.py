@@ -39,7 +39,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.models.unet import BaseUNetHalf as UNet
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
-from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics
+from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint
 from src.data.dataset import BlendMapDataset
 
 
@@ -229,10 +229,31 @@ def train(args: dict):
         gamma=args.get("lr_gamma", 0.1),
     )
 
+    # ── Resume from full checkpoint ──
+    best_val_loss = float("inf")
+    best_epoch = -1
+    start_epoch = args.get("start_epoch", 0)
+    resume_path = args.get("resume_path", "")
+    if resume_path and os.path.isfile(resume_path):
+        ckpt = load_full_checkpoint(resume_path, model, optimizer, scheduler, device=str(device))
+        model = ckpt["model"].to(device)
+        start_epoch = ckpt["start_epoch"]
+        best_val_loss = ckpt["best_val_loss"]
+        best_epoch = start_epoch  # approximate
+        print(f"Resuming from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+
     # ── Dirs ──
     save_dir = args.get("save_dir", "weights-local")
+    # When resuming, keep the same directory; otherwise create a timestamped sub-dir
+    if not resume_path:
+        run_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        save_dir = os.path.join(save_dir, run_tag)
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(os.path.join(save_dir, "results"), exist_ok=True)
+    # Save the config used for this run
+    with open(os.path.join(save_dir, "config.yaml"), "w") as f:
+        yaml.dump(args, f, default_flow_style=False, sort_keys=False)
+    print(f"Save dir: {save_dir}")
 
     # ── MLflow ──
     use_mlflow = args.get("use_mlflow", False) and mlflow is not None
@@ -243,9 +264,6 @@ def train(args: dict):
         mlflow.log_params({k: v for k, v in args.items() if isinstance(v, (str, int, float, bool))})
 
     # ── Training loop ──
-    best_val_loss = float("inf")
-    best_epoch = -1
-    start_epoch = args.get("start_epoch", 0)
     num_epochs = args.get("num_epochs", 10)
 
     for epoch in range(start_epoch, num_epochs):
@@ -283,15 +301,29 @@ def train(args: dict):
         if val_results["total_loss"] < best_val_loss:
             best_val_loss = val_results["total_loss"]
             best_epoch = epoch + 1
+            # Save inference-ready weights
             torch.save(model.state_dict(), os.path.join(save_dir, "double_chin_bmap_best.pth"))
+            # Save full checkpoint for resuming
+            save_full_checkpoint(
+                os.path.join(save_dir, "checkpoint_best.pth"),
+                model, optimizer, scheduler, epoch, best_val_loss,
+            )
             print(f"  ✓ New best (epoch {best_epoch}, loss {best_val_loss:.4f})")
 
         # Periodic save
         if (epoch + 1) % args.get("save_interval", 5) == 0:
             torch.save(model.state_dict(), os.path.join(save_dir, f"double_chin_bmap_epoch_{epoch+1}.pth"))
+            save_full_checkpoint(
+                os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth"),
+                model, optimizer, scheduler, epoch, best_val_loss,
+            )
 
     # Final save
     torch.save(model.state_dict(), os.path.join(save_dir, "double_chin_bmap_final.pth"))
+    save_full_checkpoint(
+        os.path.join(save_dir, "checkpoint_latest.pth"),
+        model, optimizer, scheduler, num_epochs - 1, best_val_loss,
+    )
     print(f"\nDone. Best epoch {best_epoch}, val_loss {best_val_loss:.4f}")
     print(f"Saved to {save_dir}/")
 

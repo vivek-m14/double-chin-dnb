@@ -24,7 +24,7 @@ from src.models.unet import BaseUNetHalf as UNet
 from src.data.dataset import create_data_loaders
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
-from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics
+from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint
 
 
 def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, world_size, epoch, num_epochs):
@@ -277,6 +277,20 @@ def train_skin_retouching_model(local_rank, world_size, args):
         gamma=args.get('lr_gamma', 0.1)
     )
     
+    # Resume from full checkpoint if provided
+    best_test_loss = float('inf')
+    best_epoch = -1
+    start_epoch = args.get('start_epoch', 0)
+    resume_path = args.get('resume_path', '')
+    if resume_path and os.path.isfile(resume_path):
+        ckpt = load_full_checkpoint(resume_path, model, optimizer, scheduler, device=str(device))
+        model = ckpt['model'].to(device)
+        start_epoch = ckpt['start_epoch']
+        best_test_loss = ckpt['best_val_loss']
+        best_epoch = start_epoch
+        if local_rank == 0:
+            print(f"Resuming from epoch {start_epoch}, best_val_loss={best_test_loss:.4f}")
+    
     # Create save directory
     save_dir = args.get('save_dir', 'weights')
     if local_rank == 0:
@@ -284,11 +298,11 @@ def train_skin_retouching_model(local_rank, world_size, args):
             os.makedirs(save_dir)
         if not os.path.exists(os.path.join(save_dir, 'results')):
             os.makedirs(os.path.join(save_dir, 'results'))
+        # Save the config used for this run
+        with open(os.path.join(save_dir, 'config.yaml'), 'w') as f:
+            yaml.dump(args, f, default_flow_style=False, sort_keys=False)
     
     # Training loop
-    best_test_loss = float('inf')
-    best_epoch = -1
-    start_epoch = args.get('start_epoch', 0)
     num_epochs = args.get('num_epochs', 100)
     
     start_time = time.time()
@@ -343,11 +357,19 @@ def train_skin_retouching_model(local_rank, world_size, args):
                 best_test_loss = test_results['total_loss']
                 best_epoch = epoch + 1
                 torch.save(model.module.state_dict(), f"{save_dir}/double_chin_bmap_best.pth")
+                save_full_checkpoint(
+                    f"{save_dir}/checkpoint_best.pth",
+                    model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
+                )
                 print(f"New best model saved! (Epoch {best_epoch}, Loss: {best_test_loss:.4f})")
             
             # Save regular checkpoint (every N epochs)
             if (epoch + 1) % args.get('save_interval', 5) == 0:
                 torch.save(model.module.state_dict(), f"{save_dir}/double_chin_bmap_epoch_{epoch + 1}.pth")
+                save_full_checkpoint(
+                    f"{save_dir}/checkpoint_epoch_{epoch + 1}.pth",
+                    model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
+                )
         
         # Update learning rate
         scheduler.step()
@@ -361,6 +383,10 @@ def train_skin_retouching_model(local_rank, world_size, args):
     # Save final model
     if local_rank == 0:
         torch.save(model.module.state_dict(), f'{save_dir}/double_chin_bmap_final.pth')
+        save_full_checkpoint(
+            f'{save_dir}/checkpoint_latest.pth',
+            model, optimizer, scheduler, num_epochs - 1, best_test_loss, is_ddp=True,
+        )
         print("Finished Training")
         print(f"Best model was from epoch {best_epoch} with test loss: {best_test_loss:.4f}")
         print(f"Final model saved as '{save_dir}/double_chin_bmap_final.pth'")
@@ -433,9 +459,14 @@ def main():
     # Load configuration from YAML file
     config = load_config()
     
-    # Modify save_dir to include project name suffix
+    # Modify save_dir to include project name suffix and timestamp
     project_suffix = config['project_name'].split("-")[-1]
-    config['save_dir'] = config['save_dir'] + project_suffix
+    base_save_dir = config['save_dir'] + project_suffix
+    if not config.get('resume_path'):
+        run_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        config['save_dir'] = os.path.join(base_save_dir, run_tag)
+    else:
+        config['save_dir'] = base_save_dir
     
     # Add distributed training parameters
     world_size = torch.cuda.device_count()
