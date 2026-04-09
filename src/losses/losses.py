@@ -36,7 +36,13 @@ class PerceptualLoss(nn.Module):
         # Make sure model is on the same device as inputs
         if next(self.parameters()).device != x.device:
             self.to(x.device)
-            
+
+        # ImageNet normalization — VGG16 expects this distribution
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+        std  = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+        x = (x - mean) / std
+        y = (y - mean) / std
+
         # Extract feature maps
         h_x = x
         h_y = y

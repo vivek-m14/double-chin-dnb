@@ -215,6 +215,84 @@ def load_checkpoint(model, checkpoint_path):
     return model
 
 
+def save_training_data_montage(data_loader, save_dir, num_montages=5, samples_per_montage=8, thumb_size=256):
+    """
+    Save YOLO-style montage grids of training data (with augmentations applied).
+
+    Each montage is a grid of ``samples_per_montage`` rows × 3 columns:
+        Input | Blend Map | Ground Truth
+
+    Column headers are burned into the top of each montage.
+
+    Args:
+        data_loader: Training DataLoader (yields augmented batches)
+        save_dir: Directory to save montage images
+        num_montages: Number of montage images to generate (default 5)
+        samples_per_montage: Number of samples (rows) per montage (default 8)
+        thumb_size: Height/width of each thumbnail cell in pixels
+    """
+    montage_dir = os.path.join(save_dir, 'train_data_montage')
+    os.makedirs(montage_dir, exist_ok=True)
+
+    headers = ['Input', 'Blend Map', 'Ground Truth']
+    num_cols = len(headers)
+    header_h = 36  # pixels for the header row
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.8
+    font_thickness = 2
+
+    collected = []  # list of (image, blend_map, gt) numpy arrays
+    total_needed = num_montages * samples_per_montage
+
+    for batch in data_loader:
+        images = batch['image']       # [B, 3, H, W]
+        blend_maps = batch['blend_map']
+        gts = batch['gt']
+        for i in range(images.size(0)):
+            if len(collected) >= total_needed:
+                break
+            img_np = (images[i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            bm_np = (blend_maps[i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            gt_np = (gts[i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            collected.append((img_np, bm_np, gt_np))
+        if len(collected) >= total_needed:
+            break
+
+    # Build montages
+    for m_idx in range(num_montages):
+        start = m_idx * samples_per_montage
+        samples = collected[start:start + samples_per_montage]
+        if not samples:
+            break
+
+        grid_w = num_cols * thumb_size
+        grid_h = header_h + len(samples) * thumb_size
+        canvas = np.ones((grid_h, grid_w, 3), dtype=np.uint8) * 40  # dark grey bg
+
+        # Draw column headers
+        for col_idx, label in enumerate(headers):
+            text_size = cv2.getTextSize(label, font, font_scale, font_thickness)[0]
+            x = col_idx * thumb_size + (thumb_size - text_size[0]) // 2
+            y = header_h - 10
+            cv2.putText(canvas, label, (x, y), font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
+
+        # Fill grid cells
+        for row_idx, (img, bm, gt) in enumerate(samples):
+            y_off = header_h + row_idx * thumb_size
+            for col_idx, cell in enumerate([img, bm, gt]):
+                x_off = col_idx * thumb_size
+                thumb = cv2.resize(cell, (thumb_size, thumb_size), interpolation=cv2.INTER_AREA)
+                # RGB → BGR for cv2.imwrite
+                thumb_bgr = cv2.cvtColor(thumb, cv2.COLOR_RGB2BGR)
+                canvas[y_off:y_off + thumb_size, x_off:x_off + thumb_size] = thumb_bgr
+
+        path = os.path.join(montage_dir, f'train_montage_{m_idx + 1}.jpg')
+        cv2.imwrite(path, canvas, [cv2.IMWRITE_JPEG_QUALITY, 92])
+
+    print(f"Saved {min(num_montages, len(collected) // max(samples_per_montage, 1))} "
+          f"training data montages to {montage_dir}")
+
+
 def save_visualization_batch(batch, outputs, save_dir, prefix="", max_samples=4):
     """
     Save visualization of model outputs.

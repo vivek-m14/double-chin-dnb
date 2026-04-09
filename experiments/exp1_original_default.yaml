@@ -1,0 +1,50 @@
+# Experiment 1: Original model (BaseUNetHalf + sigmoid)
+# Reproduces the initial commit training setup with current infrastructure fixes.
+
+# Dataset configuration
+data_root: "/workspace"
+data_json: "/workspace/double_chin_data_v3/data_v3_data_final.json"
+
+# Reproducibility
+seed: 42
+
+# Model — original full UNet with sigmoid output
+model_variant: 'default'            # BaseUNetHalf (original model)
+last_layer_activation: 'sigmoid'    # original sigmoid output [0, 1]
+blend_scale: 0.5                    # unused for sigmoid, kept for compatibility
+
+# Training parameters
+num_epochs: 150
+batch_size: 8
+learning_rate: 0.0001
+img_size: 1024
+num_workers: 8
+
+# Loss weights
+lambda_blend_mse: 1.0
+lambda_image_mse: 1.0
+lambda_perc: 0.1
+lambda_tv: 0.1
+
+# Learning rate scheduler
+lr_scheduler: 'step'     # original used StepLR
+lr_step_size: 50
+lr_gamma: 0.1
+lr_min: 1.0e-6
+
+# Checkpoint settings
+save_dir: 'weights-blend-maps/'
+pretrained_path: ''
+resume_path: ''
+save_interval: 5
+start_epoch: 0
+
+# Distributed training
+port: 12350
+
+# MLflow logging
+test: false
+use_mlflow: true
+mlflow_tracking_uri: 'https://mlflow.aftershoot.dev/'
+project_name: 'vk-dbc-blendmap-exp'
+run_name: 'exp1-default-sigmoid-stepLR'

@@ -25,7 +25,7 @@ from src.models.unet import BaseUNetHalf, BaseUNetHalfLite
 from src.data.dataset import create_data_loaders
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
-from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint, get_git_sha, CSVMetricsLogger
+from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint, get_git_sha, CSVMetricsLogger, save_training_data_montage
 
 
 def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, world_size, epoch, num_epochs):
@@ -75,6 +75,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
 
         # Backward and optimize
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         # Update running losses
@@ -354,6 +355,10 @@ def train_skin_retouching_model(local_rank, world_size, args):
     
     # CSV metrics logger (rank 0 only)
     csv_logger = CSVMetricsLogger(save_dir) if local_rank == 0 else None
+
+    # Save YOLO-style training data montages (rank 0 only, before training starts)
+    if local_rank == 0:
+        save_training_data_montage(train_loader, save_dir, num_montages=5, samples_per_montage=8)
 
     # Training loop
     num_epochs = args.get('num_epochs', 100)
