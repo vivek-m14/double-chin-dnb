@@ -15,7 +15,7 @@ blend_scale: 0.5                    # unused for sigmoid, kept for compatibility
 
 # Training parameters
 num_epochs: 150
-batch_size: 8
+batch_size: 12
 learning_rate: 0.0001
 img_size: 1024
 num_workers: 8
