@@ -17,6 +17,7 @@ import datetime
 import time
 import random
 import numpy as np
+import traceback
 
 # Add the parent directory to the path so we can import from src
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -258,6 +259,14 @@ def train_skin_retouching_model(local_rank, world_size, args):
             print(f"Loading pretrained model from {args['pretrained_path']}")
         model = load_checkpoint(model, args['pretrained_path'])
     
+    # Ensure VGG16 weights are cached before all ranks try to load them
+    # (prevents download race conditions)
+    if local_rank == 0:
+        from torchvision.models import vgg16, VGG16_Weights
+        _ = vgg16(weights=VGG16_Weights.DEFAULT)
+        del _
+    dist.barrier()  # other ranks wait for rank 0 to finish downloading
+
     # Create loss function
     criterion = CombinedLoss(
         lambda_blend_mse=args.get('lambda_blend_mse', 1.0),
@@ -296,18 +305,33 @@ def train_skin_retouching_model(local_rank, world_size, args):
         if local_rank == 0:
             print(f"Resuming from epoch {start_epoch}, best_val_loss={best_test_loss:.4f}")
 
-    print(f"Process {local_rank}: Wrapping model with DDP")
+    # Flush any pending CUDA errors and sync all ranks before DDP
+    try:
+        torch.cuda.synchronize()
+    except RuntimeError as e:
+        print(f"Process {local_rank}: CUDA error before DDP: {e}", flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
+
+    print(f"Process {local_rank}: Pre-DDP barrier", flush=True)
+    dist.barrier()  # ensure all ranks are alive before DDP
+    print(f"Process {local_rank}: Wrapping model with DDP", flush=True)
     try:
         # Wrap model with DDP
         model = DDP(model, device_ids=[local_rank])
-        print(f"Process {local_rank}: Model wrapped with DDP")
+        print(f"Process {local_rank}: Model wrapped with DDP", flush=True)
         
         # Ensure all processes are synchronized
-        print(f"Process {local_rank}: Waiting at barrier")
+        print(f"Process {local_rank}: Waiting at post-DDP barrier", flush=True)
         dist.barrier()
-        print(f"Process {local_rank}: Passed barrier")
+        print(f"Process {local_rank}: Passed barrier", flush=True)
     except Exception as e:
-        print(f"Process {local_rank}: Failed to initialize DDP: {e}")
+        print(f"Process {local_rank}: Failed to initialize DDP: {e}", flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
         raise e
     
     # Create save directory
@@ -456,6 +480,12 @@ def main_worker(local_rank, world_size, args):
     # Start training (with proper NCCL cleanup on crash)
     try:
         train_skin_retouching_model(local_rank, world_size, args)
+    except Exception as e:
+        print(f"Process {local_rank}: Training crashed with: {e}", flush=True)
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
