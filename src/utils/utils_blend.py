@@ -244,24 +244,28 @@ def save_training_data_montage(data_loader, save_dir, num_montages=5, samples_pe
     collected = []  # list of (image, blend_map, gt) numpy arrays
     total_needed = num_montages * samples_per_montage
 
-    # Use explicit iterator so we can cleanly shut down DataLoader workers
-    dl_iter = iter(data_loader)
-    try:
-        for batch in dl_iter:
-            images = batch['image']       # [B, 3, H, W]
-            blend_maps = batch['blend_map']
-            gts = batch['gt']
-            for i in range(images.size(0)):
-                if len(collected) >= total_needed:
-                    break
-                img_np = (images[i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                bm_np = (blend_maps[i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                gt_np = (gts[i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
-                collected.append((img_np, bm_np, gt_np))
+    # Use a temporary single-process DataLoader to avoid worker cleanup issues
+    # (the montage only needs a handful of batches — no benefit from multiprocessing)
+    from torch.utils.data import DataLoader
+    tmp_loader = DataLoader(
+        data_loader.dataset,
+        batch_size=data_loader.batch_size,
+        shuffle=True,
+        num_workers=0,  # no worker processes → no messy cleanup on early break
+    )
+    for batch in tmp_loader:
+        images = batch['image']       # [B, 3, H, W]
+        blend_maps = batch['blend_map']
+        gts = batch['gt']
+        for i in range(images.size(0)):
             if len(collected) >= total_needed:
                 break
-    finally:
-        del dl_iter  # explicitly release iterator → clean worker shutdown
+            img_np = (images[i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            bm_np = (blend_maps[i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            gt_np = (gts[i].permute(1, 2, 0).cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+            collected.append((img_np, bm_np, gt_np))
+        if len(collected) >= total_needed:
+            break
 
     # Build montages
     for m_idx in range(num_montages):
