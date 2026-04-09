@@ -2,7 +2,7 @@ import os
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, Subset, random_split
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.transforms import ToTensor, ColorJitter
 import torchvision.transforms.functional as TF
@@ -51,12 +51,13 @@ class BlendMapDataset(Dataset):
     # BLEND_MAP_IMAGE = "blendmap_image_cropped"
     # GT_IMAGE = "edited_image_cropped"
 
-    def __init__(self, data_root, data_json, transform=None, resize_dim=(1024, 1024), test=False):
+    def __init__(self, data_root, data_json, transform=None, resize_dim=(1024, 1024), test=False, augment=True):
         self.data_root = data_root
         data_json = data_json
 
         self.transform = transform
         self.resize_dim = resize_dim
+        self.augment = augment
 
         data_map = json.load(open(data_json))
 
@@ -137,7 +138,8 @@ class BlendMapDataset(Dataset):
                 blend_map = torch.from_numpy(blend_map).permute(2, 0, 1)  # Now a 3-channel tensor
                 gt = torch.from_numpy(gt).permute(2, 0, 1)
 
-            image, blend_map, gt = self.apply_augmentation(image, blend_map, gt)
+            if self.augment:
+                image, blend_map, gt = self.apply_augmentation(image, blend_map, gt)
 
             return {
                 'image': image,
@@ -308,31 +310,40 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
     Returns:
         tuple: (train_loader, test_loader, train_sampler, test_sampler)
     """
-    # Create dataset
-    if dataset_type == 'blend_map':
-        dataset = BlendMapDataset(
-        args['data_root'], 
-        args['data_json'], 
-        # args['gt_dir'], 
-        transform=ToTensor(), 
+    # Create dataset(s)
+    common_kwargs = dict(
+        data_root=args['data_root'],
+        data_json=args['data_json'],
+        transform=ToTensor(),
         resize_dim=(args['img_size'], args['img_size']),
-        test=test
+        test=test,
     )
+
+    if dataset_type == 'blend_map':
+        train_ds_full = BlendMapDataset(**common_kwargs, augment=True)
+        val_ds_full   = BlendMapDataset(**common_kwargs, augment=False)
     elif dataset_type == 'tensor_map':
+        # Legacy flow-based path — no augment flag
         dataset = TensorMapDataset(
-            args['data_root'], 
-            args['data_json'], 
-            transform=ToTensor(), 
-            resize_dim=(args['img_size'], args['img_size'])
+            args['data_root'], args['data_json'],
+            transform=ToTensor(),
+            resize_dim=(args['img_size'], args['img_size']),
         )
+        train_ds_full = dataset
+        val_ds_full   = dataset
     else:
         raise ValueError(f"Invalid dataset type: {dataset_type}")
-    
-    # Split dataset into train and test (seeded for reproducibility)
-    train_size = int(len(dataset) * 0.9)
-    test_size = len(dataset) - train_size
+
+    # Seeded index split (identical permutation for both instances)
+    n = len(train_ds_full)
+    train_size = int(n * 0.9)
     split_gen = torch.Generator().manual_seed(args.get("seed", 42))
-    train_dataset, test_dataset = random_split(dataset, [train_size, test_size], generator=split_gen)
+    perm = torch.randperm(n, generator=split_gen).tolist()
+    train_indices = perm[:train_size]
+    val_indices   = perm[train_size:]
+
+    train_dataset = Subset(train_ds_full, train_indices)
+    test_dataset  = Subset(val_ds_full,   val_indices)
     
     # Create samplers for distributed training if world_size and rank are provided
     if world_size is not None and rank is not None:

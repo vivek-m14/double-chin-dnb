@@ -453,8 +453,13 @@ def main_worker(local_rank, world_size, args):
         print(f"Process {local_rank}: Failed to initialize process group: {e}")
         raise e
     
-    # Start training
-    train_skin_retouching_model(local_rank, world_size, args)
+    # Start training (with proper NCCL cleanup on crash)
+    try:
+        train_skin_retouching_model(local_rank, world_size, args)
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        torch.cuda.empty_cache()
 
 
 def load_config(config_path='blend_map.yaml'):

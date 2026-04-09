@@ -30,7 +30,7 @@ import torch.nn as nn
 import torch.optim as optim
 import yaml
 from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 from torchvision.transforms import ToTensor
 from tqdm import tqdm
 
@@ -79,18 +79,23 @@ def get_device(requested: str = "auto") -> torch.device:
 
 def create_data_loaders(args: dict, test: bool = False):
     """Create train/val DataLoaders (no DDP, no DistributedSampler)."""
-    dataset = BlendMapDataset(
-        args["data_root"],
-        args["data_json"],
+    common = dict(
+        data_root=args["data_root"],
+        data_json=args["data_json"],
         transform=ToTensor(),
         resize_dim=(args["img_size"], args["img_size"]),
         test=test,
     )
+    train_ds_full = BlendMapDataset(**common, augment=True)
+    val_ds_full   = BlendMapDataset(**common, augment=False)
 
-    train_size = int(len(dataset) * 0.9)
-    val_size = len(dataset) - train_size
+    # Seeded index split (same permutation for both instances)
+    n = len(train_ds_full)
+    train_size = int(n * 0.9)
     split_gen = torch.Generator().manual_seed(args.get("seed", 42))
-    train_ds, val_ds = random_split(dataset, [train_size, val_size], generator=split_gen)
+    perm = torch.randperm(n, generator=split_gen).tolist()
+    train_ds = Subset(train_ds_full, perm[:train_size])
+    val_ds   = Subset(val_ds_full,   perm[train_size:])
 
     common = dict(
         batch_size=args.get("batch_size", 2),
