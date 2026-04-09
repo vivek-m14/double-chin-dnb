@@ -24,7 +24,7 @@ from src.models.unet import BaseUNetHalf, BaseUNetHalfLite
 from src.data.dataset import create_data_loaders
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
-from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint, get_git_sha
+from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint, get_git_sha, CSVMetricsLogger
 
 
 def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, world_size, epoch, num_epochs):
@@ -141,7 +141,7 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
             pred_blend_maps = model(images)
             
             # Apply blend formula to get retouched images
-            retouched_images = apply_blend_formula(images, pred_blend_maps).to(device)
+            retouched_images = apply_blend_formula(images, pred_blend_maps)
 
             # Calculate combined loss
             loss, losses_dict = criterion(pred_blend_maps, target_blend_maps, retouched_images, gt_images)
@@ -159,8 +159,8 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
             if local_rank == 0:
                 test_bar.set_postfix(Loss=loss.item())
 
-            # Save some test results for visualization
-            if local_rank == 0 and save_dir and batch_idx < 10:  # Save first 2 batches
+            # Save visualizations for first 10 batches
+            if local_rank == 0 and save_dir and batch_idx < 10:
                 vis_save_dir = os.path.join(save_dir, 'results', f'epoch_{epoch+1}')
                 if not os.path.exists(vis_save_dir):
                     os.makedirs(vis_save_dir)
@@ -239,6 +239,11 @@ def train_skin_retouching_model(local_rank, world_size, args):
         blend_scale=args.get('blend_scale', 0.5),
     )
     model = model.to(device)
+    model_config = {
+        'model_variant': args.get('model_variant', 'default'),
+        'last_layer_activation': args.get('last_layer_activation', 'sigmoid'),
+        'blend_scale': args.get('blend_scale', 0.5),
+    }
     print(f"Process {local_rank}: Model created and moved to device")
 
     # get number of parameters and size in MB
@@ -253,20 +258,6 @@ def train_skin_retouching_model(local_rank, world_size, args):
             print(f"Loading pretrained model from {args['pretrained_path']}")
         model = load_checkpoint(model, args['pretrained_path'])
     
-    print(f"Process {local_rank}: Wrapping model with DDP")
-    try:
-        # Wrap model with DDP
-        model = DDP(model, device_ids=[local_rank])
-        print(f"Process {local_rank}: Model wrapped with DDP")
-        
-        # Ensure all processes are synchronized
-        print(f"Process {local_rank}: Waiting at barrier")
-        dist.barrier()
-        print(f"Process {local_rank}: Passed barrier")
-    except Exception as e:
-        print(f"Process {local_rank}: Failed to initialize DDP: {e}")
-        raise e
-    
     # Create loss function
     criterion = CombinedLoss(
         lambda_blend_mse=args.get('lambda_blend_mse', 1.0),
@@ -275,7 +266,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
         lambda_tv=args.get('lambda_tv', 0.1)
     ).to(device)  # Explicitly move criterion to device
     
-    # Create optimizer and scheduler
+    # Create optimizer and scheduler (on raw model, before DDP)
     optimizer = optim.Adam(model.parameters(), lr=args.get('learning_rate', 0.0001))
     scheduler_type = args.get('lr_scheduler', 'step')
     if scheduler_type == 'cosine':
@@ -291,7 +282,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
             gamma=args.get('lr_gamma', 0.1)
         )
     
-    # Resume from full checkpoint if provided
+    # Resume from full checkpoint BEFORE DDP wrapping
     best_test_loss = float('inf')
     best_epoch = -1
     start_epoch = args.get('start_epoch', 0)
@@ -301,9 +292,23 @@ def train_skin_retouching_model(local_rank, world_size, args):
         model = ckpt['model'].to(device)
         start_epoch = ckpt['start_epoch']
         best_test_loss = ckpt['best_val_loss']
-        best_epoch = start_epoch
+        best_epoch = start_epoch  # approximate — the true best epoch isn't stored
         if local_rank == 0:
             print(f"Resuming from epoch {start_epoch}, best_val_loss={best_test_loss:.4f}")
+
+    print(f"Process {local_rank}: Wrapping model with DDP")
+    try:
+        # Wrap model with DDP
+        model = DDP(model, device_ids=[local_rank])
+        print(f"Process {local_rank}: Model wrapped with DDP")
+        
+        # Ensure all processes are synchronized
+        print(f"Process {local_rank}: Waiting at barrier")
+        dist.barrier()
+        print(f"Process {local_rank}: Passed barrier")
+    except Exception as e:
+        print(f"Process {local_rank}: Failed to initialize DDP: {e}")
+        raise e
     
     # Create save directory
     save_dir = args.get('save_dir', 'weights')
@@ -316,8 +321,12 @@ def train_skin_retouching_model(local_rank, world_size, args):
         with open(os.path.join(save_dir, 'config.yaml'), 'w') as f:
             yaml.dump(args, f, default_flow_style=False, sort_keys=False)
     
+    # CSV metrics logger (rank 0 only)
+    csv_logger = CSVMetricsLogger(save_dir) if local_rank == 0 else None
+
     # Training loop
     num_epochs = args.get('num_epochs', 100)
+    save_interval = args.get('save_interval', 5)
     
     start_time = time.time()
     for epoch in range(start_epoch, num_epochs):
@@ -325,6 +334,10 @@ def train_skin_retouching_model(local_rank, world_size, args):
         epoch_start_time = time.time()
         train_sampler.set_epoch(epoch)
         
+        # Only save visualizations every save_interval epochs (and first + last)
+        is_vis_epoch = (epoch == start_epoch) or ((epoch + 1) % save_interval == 0) or (epoch + 1 == num_epochs)
+        vis_dir = save_dir if is_vis_epoch else None
+
         # Train
         train_losses = train_epoch(
             model, train_loader, optimizer, criterion, device, 
@@ -347,7 +360,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
         # Validate
         test_results = validate(
             model, test_loader, criterion, device, local_rank, 
-            world_size, epoch, num_epochs, save_dir
+            world_size, epoch, num_epochs, vis_dir
         )
         
         # Log validation results
@@ -366,24 +379,32 @@ def train_skin_retouching_model(local_rank, world_size, args):
                     'test_psnr': test_results['psnr'],
                 }, step=epoch + 1)
             
+            # CSV logging (always, even if MLflow is off)
+            csv_logger.log_epoch(
+                epoch=epoch + 1,
+                train_losses=train_losses,
+                val_results=test_results,
+                lr=optimizer.param_groups[0]['lr'],
+                epoch_time=time.time() - epoch_start_time,
+            )
+
             # Save best model
             if test_results['total_loss'] < best_test_loss:
                 best_test_loss = test_results['total_loss']
                 best_epoch = epoch + 1
-                torch.save(model.module.state_dict(), f"{save_dir}/double_chin_bmap_best.pth")
                 save_full_checkpoint(
                     f"{save_dir}/checkpoint_best.pth",
                     model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
+                    model_config=model_config,
                 )
                 print(f"New best model saved! (Epoch {best_epoch}, Loss: {best_test_loss:.4f})")
             
-            # Save regular checkpoint (every N epochs)
-            if (epoch + 1) % args.get('save_interval', 5) == 0:
-                torch.save(model.module.state_dict(), f"{save_dir}/double_chin_bmap_epoch_{epoch + 1}.pth")
-                save_full_checkpoint(
-                    f"{save_dir}/checkpoint_epoch_{epoch + 1}.pth",
-                    model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
-                )
+            # Rolling latest checkpoint (overwritten every epoch for crash recovery)
+            save_full_checkpoint(
+                f"{save_dir}/checkpoint_latest.pth",
+                model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
+                model_config=model_config,
+            )
         
         # Update learning rate
         scheduler.step()
@@ -394,19 +415,15 @@ def train_skin_retouching_model(local_rank, world_size, args):
             ETA = (num_epochs - epoch - 1) * (epoch_end_time - epoch_start_time)
             print(f"ETA: {datetime.timedelta(seconds=ETA)}")
     
-    # Save final model
+    # Cleanup and final logging
     if local_rank == 0:
-        torch.save(model.module.state_dict(), f'{save_dir}/double_chin_bmap_final.pth')
-        save_full_checkpoint(
-            f'{save_dir}/checkpoint_latest.pth',
-            model, optimizer, scheduler, num_epochs - 1, best_test_loss, is_ddp=True,
-        )
+        if csv_logger:
+            csv_logger.close()
         print("Finished Training")
         print(f"Best model was from epoch {best_epoch} with test loss: {best_test_loss:.4f}")
-        print(f"Final model saved as '{save_dir}/double_chin_bmap_final.pth'")
         
         if args.get('use_mlflow', True):
-            mlflow.log_artifact(f'{save_dir}/double_chin_bmap_best.pth')
+            mlflow.log_artifact(f'{save_dir}/checkpoint_best.pth')
             mlflow.end_run()
 
 
@@ -456,8 +473,8 @@ def load_config(config_path='blend_map.yaml'):
     if config.get('test', False):    
         config['use_mlflow'] = False
         config['test'] = True
-        config['project_name'] = config['project_name']+'_test'
-        config['save_dir'] = config['save_dir']+'_test'
+        config['project_name'] = config['project_name'] + '_test'
+        config['save_dir'] = config['save_dir'].rstrip('/') + '_test'
 
     return config
 
@@ -470,12 +487,17 @@ def cleanup():
 
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description="Distributed blend-map training")
+    parser.add_argument("--config", "-c", default="blend_map.yaml", help="YAML config path")
+    cli = parser.parse_args()
+
     # Load configuration from YAML file
-    config = load_config()
+    config = load_config(cli.config)
     
     # Modify save_dir to include project name suffix and timestamp
     project_suffix = config['project_name'].split("-")[-1]
-    base_save_dir = config['save_dir'] + project_suffix
+    base_save_dir = os.path.join(config['save_dir'], project_suffix)
     if not config.get('resume_path'):
         run_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         config['save_dir'] = os.path.join(base_save_dir, run_tag)

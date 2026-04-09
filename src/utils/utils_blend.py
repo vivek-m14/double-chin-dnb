@@ -1,8 +1,87 @@
+import csv
 import os
 import subprocess
 import torch
 import cv2
 import numpy as np
+
+
+class CSVMetricsLogger:
+    """Append-friendly CSV logger for per-epoch training metrics.
+
+    Creates (or reopens) a ``metrics.csv`` file in *save_dir*.  A header row
+    is written only when the file is first created.  Each call to
+    :meth:`log_epoch` appends a single data row and flushes immediately so
+    nothing is lost on a crash.
+
+    The column order is fixed so every run produces an identical schema that
+    is easy to ``pd.read_csv()`` later.
+    """
+
+    COLUMNS = [
+        "epoch",
+        "train_total_loss",
+        "train_blend_map_loss",
+        "train_image_mse_loss",
+        "train_perc_loss",
+        "train_tv_loss",
+        "val_total_loss",
+        "val_blend_map_loss",
+        "val_image_mse_loss",
+        "val_perc_loss",
+        "val_tv_loss",
+        "val_psnr",
+        "lr",
+        "epoch_time_s",
+    ]
+
+    def __init__(self, save_dir: str, filename: str = "metrics.csv"):
+        self.path = os.path.join(save_dir, filename)
+        write_header = not os.path.exists(self.path)
+        self._fp = open(self.path, "a", newline="")
+        self._writer = csv.writer(self._fp)
+        if write_header:
+            self._writer.writerow(self.COLUMNS)
+            self._fp.flush()
+
+    # ── public API ──
+
+    def log_epoch(
+        self,
+        epoch: int,
+        train_losses: dict,
+        val_results: dict,
+        lr: float,
+        epoch_time: float,
+    ) -> None:
+        """Write one row of metrics for the completed *epoch* (1-based)."""
+        row = [
+            epoch,
+            train_losses.get("total_loss", 0.0),
+            train_losses.get("blend_map_loss", 0.0),
+            train_losses.get("image_mse_loss", 0.0),
+            train_losses.get("perc_loss", 0.0),
+            train_losses.get("tv_loss", 0.0),
+            val_results.get("total_loss", 0.0),
+            val_results.get("blend_map_loss", 0.0),
+            val_results.get("image_mse_loss", 0.0),
+            val_results.get("perc_loss", 0.0),
+            val_results.get("tv_loss", 0.0),
+            val_results.get("psnr", 0.0),
+            lr,
+            round(epoch_time, 1),
+        ]
+        self._writer.writerow(row)
+        self._fp.flush()
+
+    def close(self):
+        self._fp.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
 
 
 def get_git_sha():
@@ -22,7 +101,7 @@ def get_git_sha():
         return 'unknown'
 
 
-def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss, is_ddp=False, git_sha=None):
+def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss, is_ddp=False, git_sha=None, model_config=None):
     """
     Save a full training checkpoint for resumable training.
 
@@ -34,16 +113,23 @@ def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss
         epoch: Current epoch (0-based, the epoch that just finished)
         best_val_loss: Best validation loss so far
         is_ddp: Whether the model is wrapped in DDP (will save module.state_dict)
+        git_sha: Git commit hash (auto-detected if None)
+        model_config: Dict with model architecture info (model_variant, last_layer_activation, blend_scale)
     """
     state_dict = model.module.state_dict() if is_ddp else model.state_dict()
-    torch.save({
+    tmp_path = path + '.tmp'
+    payload = {
         'epoch': epoch,
         'model_state_dict': state_dict,
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'best_val_loss': best_val_loss,
         'git_sha': git_sha or get_git_sha(),
-    }, path)
+    }
+    if model_config is not None:
+        payload['model_config'] = model_config
+    torch.save(payload, tmp_path)
+    os.replace(tmp_path, path)  # atomic on Linux/macOS — crash-safe
 
 
 def load_full_checkpoint(path, model, optimizer=None, scheduler=None, device='cpu'):
@@ -108,22 +194,19 @@ def load_checkpoint(model, checkpoint_path):
     try:
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
         
-        # Try to handle different checkpoint formats
+        # Extract raw state_dict from various checkpoint formats
         if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            state_dict = checkpoint['model_state_dict']
         elif 'state_dict' in checkpoint:
-            # Remove 'module.' prefix if present (from DDP)
             state_dict = checkpoint['state_dict']
-            new_state_dict = {}
-            for k, v in state_dict.items():
-                if k.startswith('module.'):
-                    new_state_dict[k[7:]] = v
-                else:
-                    new_state_dict[k] = v
-            model.load_state_dict(new_state_dict)
+        elif isinstance(checkpoint, dict) and any(k.endswith('.weight') for k in checkpoint):
+            state_dict = checkpoint
         else:
-            # Assume the checkpoint is directly the state dict
-            model.load_state_dict(checkpoint)
+            state_dict = checkpoint
+
+        # Strip DDP 'module.' prefix if present
+        clean = {k.removeprefix('module.'): v for k, v in state_dict.items()}
+        model.load_state_dict(clean)
             
         print(f"Successfully loaded checkpoint from {checkpoint_path}")
     except Exception as e:

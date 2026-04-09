@@ -39,7 +39,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.models.unet import BaseUNetHalf, BaseUNetHalfLite
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
-from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint, get_git_sha
+from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint, get_git_sha, CSVMetricsLogger
 from src.data.dataset import BlendMapDataset
 
 
@@ -211,6 +211,11 @@ def train(args: dict):
         last_layer_activation=args.get('last_layer_activation', 'sigmoid'),
         blend_scale=args.get('blend_scale', 0.5),
     ).to(device)
+    model_config = {
+        'model_variant': args.get('model_variant', 'default'),
+        'last_layer_activation': args.get('last_layer_activation', 'sigmoid'),
+        'blend_scale': args.get('blend_scale', 0.5),
+    }
     params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {params:,} ({params/1e6:.1f}M)")
 
@@ -252,7 +257,7 @@ def train(args: dict):
         model = ckpt["model"].to(device)
         start_epoch = ckpt["start_epoch"]
         best_val_loss = ckpt["best_val_loss"]
-        best_epoch = start_epoch  # approximate
+        best_epoch = start_epoch  # approximate — the true best epoch isn't stored
         print(f"Resuming from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
 
     # ── Dirs ──
@@ -280,15 +285,22 @@ def train(args: dict):
         mlflow.log_params({k: v for k, v in args.items() if isinstance(v, (str, int, float, bool))})
         mlflow.set_tag('git_sha', args.get('git_sha', 'unknown'))
 
+    # ── CSV metrics logger ──
+    csv_logger = CSVMetricsLogger(save_dir)
+
     # ── Training loop ──
     num_epochs = args.get("num_epochs", 10)
+    save_interval = args.get("save_interval", 5)
 
     for epoch in range(start_epoch, num_epochs):
         t0 = time.time()
 
+        # Only save visualizations every save_interval epochs (and first + last)
+        is_vis_epoch = (epoch == start_epoch) or ((epoch + 1) % save_interval == 0) or (epoch + 1 == num_epochs)
+        vis_dir = save_dir if is_vis_epoch else None
+
         train_losses = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, num_epochs)
-        val_results = validate(model, val_loader, criterion, device, epoch, num_epochs, save_dir)
-        scheduler.step()
+        val_results = validate(model, val_loader, criterion, device, epoch, num_epochs, vis_dir)
 
         elapsed = time.time() - t0
         eta = (num_epochs - epoch - 1) * elapsed
@@ -314,38 +326,42 @@ def train(args: dict):
             )
             mlflow.log_metric("lr", optimizer.param_groups[0]["lr"], step=epoch + 1)
 
+        # CSV logging (always, even if MLflow is off)
+        csv_logger.log_epoch(
+            epoch=epoch + 1,
+            train_losses=train_losses,
+            val_results=val_results,
+            lr=optimizer.param_groups[0]['lr'],
+            epoch_time=elapsed,
+        )
+
         # Save best
         if val_results["total_loss"] < best_val_loss:
             best_val_loss = val_results["total_loss"]
             best_epoch = epoch + 1
-            # Save inference-ready weights
-            torch.save(model.state_dict(), os.path.join(save_dir, "double_chin_bmap_best.pth"))
-            # Save full checkpoint for resuming
             save_full_checkpoint(
                 os.path.join(save_dir, "checkpoint_best.pth"),
                 model, optimizer, scheduler, epoch, best_val_loss,
+                model_config=model_config,
             )
             print(f"  ✓ New best (epoch {best_epoch}, loss {best_val_loss:.4f})")
 
-        # Periodic save
-        if (epoch + 1) % args.get("save_interval", 5) == 0:
-            torch.save(model.state_dict(), os.path.join(save_dir, f"double_chin_bmap_epoch_{epoch+1}.pth"))
-            save_full_checkpoint(
-                os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}.pth"),
-                model, optimizer, scheduler, epoch, best_val_loss,
-            )
+        # Rolling latest checkpoint (overwritten every epoch for crash recovery)
+        save_full_checkpoint(
+            os.path.join(save_dir, "checkpoint_latest.pth"),
+            model, optimizer, scheduler, epoch, best_val_loss,
+            model_config=model_config,
+        )
 
-    # Final save
-    torch.save(model.state_dict(), os.path.join(save_dir, "double_chin_bmap_final.pth"))
-    save_full_checkpoint(
-        os.path.join(save_dir, "checkpoint_latest.pth"),
-        model, optimizer, scheduler, num_epochs - 1, best_val_loss,
-    )
+        # Update learning rate (after logging so CSV/MLflow capture current epoch's LR)
+        scheduler.step()
+
+    csv_logger.close()
     print(f"\nDone. Best epoch {best_epoch}, val_loss {best_val_loss:.4f}")
     print(f"Saved to {save_dir}/")
 
     if use_mlflow:
-        mlflow.log_artifact(os.path.join(save_dir, "double_chin_bmap_best.pth"))
+        mlflow.log_artifact(os.path.join(save_dir, "checkpoint_best.pth"))
         mlflow.end_run()
 
 

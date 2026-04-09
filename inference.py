@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Inference script for Double Chin Removal Model
-Uses blend maps to generate flow-based warping for double chin removal
+Uses blend maps with Linear Light formula for double chin removal.
 """
 
 import os
@@ -19,27 +19,21 @@ import yaml
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 from models.unet import BaseUNetHalf, BaseUNetHalfLite
-# from utils.utils import load_checkpoint
-# from blend.blend_map import apply_flow_formula
+from utils.utils_blend import load_checkpoint
 
 
-def load_checkpoint(model, checkpoint_path):
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
-    if 'model_state_dict' in checkpoint:
-        state_dict = checkpoint['model_state_dict']
-    elif 'state_dict' in checkpoint:
-        state_dict = checkpoint['state_dict']
-    else:
-        # Assume the checkpoint is directly the state dict
-        state_dict = checkpoint
+def _peek_checkpoint_config(checkpoint_path: str) -> dict:
+    """
+    Extract model_config dict from a checkpoint file.
+    The full checkpoint is deserialized into CPU memory.
+    Returns an empty dict for legacy checkpoints that don't contain model_config.
+    """
+    try:
+        ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        return ckpt.get('model_config', {})
+    except Exception:
+        return {}
 
-    # Strip 'module.' prefix from DDP-saved checkpoints
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        new_state_dict[k[7:] if k.startswith('module.') else k] = v
-
-    model.load_state_dict(new_state_dict)
-    return model
 
 class DoubleChinRemover:
     """Inference class for Double Chin Removal Model"""
@@ -48,35 +42,47 @@ class DoubleChinRemover:
                  model_path: str,
                  device: str = 'auto',
                  img_size: int = 1024,
-                 model_variant: str = 'default',
-                 last_layer_activation: str = 'sigmoid',
-                 blend_scale: float = 0.5):
+                 model_variant: str = None,
+                 last_layer_activation: str = None,
+                 blend_scale: float = None):
         """
-        Initialize the inference model
+        Initialize the inference model.
+        
+        Model architecture params (model_variant, last_layer_activation, blend_scale)
+        are auto-detected from checkpoint metadata when set to None.
+        Explicit values override checkpoint metadata.
         
         Args:
             model_path: Path to the trained model weights
-            device: Device to run inference on ('cpu', 'cuda', or 'auto')
+            device: Device to run inference on ('cpu', 'cuda', 'mps', or 'auto')
             img_size: Input image size for the model
-            model_variant: 'default' (BaseUNetHalf) or 'lite' (BaseUNetHalfLite)
-            last_layer_activation: 'sigmoid' or 'residual_tanh'
-            blend_scale: Scale for residual_tanh activation (default 0.5 = full [0,1])
+            model_variant: 'default' (BaseUNetHalf) or 'lite' (BaseUNetHalfLite).
+                           Auto-detected from checkpoint if None.
+            last_layer_activation: 'sigmoid', 'tanh', or 'residual_tanh'.
+                                   Auto-detected from checkpoint if None.
+            blend_scale: Scale for residual_tanh activation.
+                         Auto-detected from checkpoint if None.
         """
         self.model_path = model_path
         self.img_size = img_size
-        self.model_variant = model_variant
-        self.last_layer_activation = last_layer_activation
-        self.blend_scale = blend_scale
+        
+        # Auto-detect model config from checkpoint, then apply explicit overrides
+        ckpt_config = _peek_checkpoint_config(model_path)
+        self.model_variant = model_variant or ckpt_config.get('model_variant', 'default')
+        self.last_layer_activation = last_layer_activation or ckpt_config.get('last_layer_activation', 'sigmoid')
+        self.blend_scale = blend_scale if blend_scale is not None else ckpt_config.get('blend_scale', 0.5)
         
         # Set device
         if device == 'auto':
-            self.device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
         else:
             self.device = torch.device(device)
         
-        
         # Initialize model
         self.model = self._load_model()
+        
+        print(f"Model: {self.model_variant} | activation: {self.last_layer_activation} "
+              f"| blend_scale: {self.blend_scale} | device: {self.device}")
         
     def _load_model(self):
         """Load the trained model"""
@@ -90,7 +96,7 @@ class DoubleChinRemover:
             blend_scale=self.blend_scale,
         )
         
-        # Load trained weights
+        # Load trained weights (handles DDP prefix stripping)
         model = load_checkpoint(model, self.model_path)
         model.to(self.device)
         model.eval()
@@ -190,7 +196,9 @@ def run_inference(double_chin_remover, original_image) -> np.ndarray:
     return retouched_img, blend_map
 
 def save_img(image, output_path):
-    # os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     cv2.imwrite(output_path, image[..., ::-1])
 
 def main():
@@ -198,15 +206,39 @@ def main():
     parser = argparse.ArgumentParser(description='Double Chin Removal Inference')
     parser.add_argument('--input', '-i', required=True, help='Input image path')
     parser.add_argument('--output', '-o', required=True, help='Output image path')
-    parser.add_argument('--model', '-m', 
-                       default='weights-blend-maps/blend_maps_v2_5k/double_chin_bmap_best.pth',
-                       help='Model weights path')
+    parser.add_argument('--model', '-m', required=True, help='Model checkpoint path')
+    parser.add_argument('--config', '-c', default=None,
+                       help='YAML config file (model params auto-detected from checkpoint if omitted)')
     parser.add_argument('--device', '-d', default='auto', 
-                       choices=['cpu', 'cuda', 'auto'], help='Device to use')
+                       choices=['cpu', 'cuda', 'mps', 'auto'], help='Device to use')
     parser.add_argument('--img_size', type=int, default=1024, help='Input image size')
-    parser.add_argument('--save_flow', action='store_true', help='Save flow map visualization')
+    parser.add_argument('--model_variant', default=None,
+                       choices=['default', 'lite'],
+                       help='Model variant (auto-detected from checkpoint if omitted)')
+    parser.add_argument('--last_layer_activation', default=None,
+                       choices=['sigmoid', 'tanh', 'residual_tanh'],
+                       help='Output activation (auto-detected from checkpoint if omitted)')
+    parser.add_argument('--blend_scale', type=float, default=None,
+                       help='Blend scale for residual_tanh (auto-detected from checkpoint if omitted)')
+    parser.add_argument('--save_blend', action='store_true', help='Save blend map visualization')
     
     args = parser.parse_args()
+
+    # Load overrides from YAML config if provided
+    cfg_variant = None
+    cfg_activation = None
+    cfg_blend_scale = None
+    if args.config:
+        with open(args.config, 'r') as f:
+            cfg = yaml.safe_load(f)
+        cfg_variant = cfg.get('model_variant')
+        cfg_activation = cfg.get('last_layer_activation')
+        cfg_blend_scale = cfg.get('blend_scale')
+
+    # Priority: CLI args > YAML config > checkpoint metadata > defaults
+    model_variant = args.model_variant or cfg_variant
+    last_layer_activation = args.last_layer_activation or cfg_activation
+    blend_scale = args.blend_scale if args.blend_scale is not None else cfg_blend_scale
 
     # Load input image (BGR -> RGB)
     image_bgr = cv2.imread(args.input)
@@ -215,11 +247,14 @@ def main():
         sys.exit(1)
     image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
 
-    # Initialize model
+    # Initialize model (None values trigger auto-detection from checkpoint)
     remover = DoubleChinRemover(
         model_path=args.model,
         device=args.device,
-        img_size=args.img_size
+        img_size=args.img_size,
+        model_variant=model_variant,
+        last_layer_activation=last_layer_activation,
+        blend_scale=blend_scale,
     )
 
     # Run inference
@@ -229,7 +264,7 @@ def main():
         save_img(retouched_img, args.output)
         print(f"Saved retouched image to {args.output}")
 
-        if args.save_flow:
+        if args.save_blend:
             blend_path = str(Path(args.output).with_suffix('')) + '_blend_map.png'
             save_img((blend_map * 255).astype(np.uint8), blend_path)
             print(f"Saved blend map to {blend_path}")
@@ -238,7 +273,7 @@ def main():
 
     except Exception as e:
         print(f"Error during inference: {e}")
-        sys.exit(1)
+        raise
 
 
 if __name__ == "__main__":
