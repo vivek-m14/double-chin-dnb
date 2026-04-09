@@ -359,6 +359,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
     # Save YOLO-style training data montages (rank 0 only, before training starts)
     if local_rank == 0:
         save_training_data_montage(train_loader, save_dir, num_montages=5, samples_per_montage=8)
+    dist.barrier()  # sync all ranks before entering training loop
 
     # Training loop
     num_epochs = args.get('num_epochs', 100)
@@ -492,7 +493,8 @@ def main_worker(local_rank, world_size, args):
             init_method=f'tcp://localhost:{args["port"]}',
             world_size=world_size,
             rank=local_rank,
-            timeout=datetime.timedelta(seconds=600)
+            timeout=datetime.timedelta(seconds=600),
+            device_id=torch.device(f'cuda:{local_rank}'),
         )
     except Exception as e:
         print(f"Process {local_rank}: Failed to initialize process group: {e}")
