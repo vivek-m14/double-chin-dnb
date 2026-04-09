@@ -24,7 +24,7 @@ from src.models.unet import BaseUNetHalf, BaseUNetHalfLite
 from src.data.dataset import create_data_loaders
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
-from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint
+from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint, get_git_sha
 
 
 def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, world_size, epoch, num_epochs):
@@ -221,6 +221,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
             k: v for k, v in args.items()
             if isinstance(v, (str, int, float, bool))
         })
+        mlflow.set_tag('git_sha', args.get('git_sha', 'unknown'))
     
     print(f"Process {local_rank}: Creating data loaders")
     # Create data loaders
@@ -485,9 +486,10 @@ def main():
     world_size = torch.cuda.device_count()
     config['world_size'] = world_size
     config['init_method'] = f'tcp://127.0.0.1:{config["port"]}'
+    config['git_sha'] = get_git_sha()
     
     print(f"Starting distributed training with {world_size} GPUs")
-    print(f"Configuration loaded from configs/default.yaml")
+    print(f"Git SHA: {config['git_sha']}")
     print(f"Training parameters: {config['num_epochs']} epochs, batch size {config['batch_size']}, lr {config['learning_rate']}")
     print(f"Save directory: {config['save_dir']}")
     

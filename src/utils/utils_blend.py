@@ -1,10 +1,28 @@
 import os
+import subprocess
 import torch
 import cv2
 import numpy as np
 
 
-def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss, is_ddp=False):
+def get_git_sha():
+    """Return the current git short SHA, or 'unknown' if not in a git repo."""
+    try:
+        sha = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            stderr=subprocess.DEVNULL,
+        ).decode('ascii').strip()
+        # Append '-dirty' if there are uncommitted changes
+        dirty = subprocess.check_output(
+            ['git', 'status', '--porcelain'],
+            stderr=subprocess.DEVNULL,
+        ).decode('ascii').strip()
+        return f"{sha}-dirty" if dirty else sha
+    except Exception:
+        return 'unknown'
+
+
+def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss, is_ddp=False, git_sha=None):
     """
     Save a full training checkpoint for resumable training.
 
@@ -24,6 +42,7 @@ def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'best_val_loss': best_val_loss,
+        'git_sha': git_sha or get_git_sha(),
     }, path)
 
 

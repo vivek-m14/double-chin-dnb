@@ -39,7 +39,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.models.unet import BaseUNetHalf, BaseUNetHalfLite
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
-from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint
+from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint, get_git_sha
 from src.data.dataset import BlendMapDataset
 
 
@@ -263,10 +263,13 @@ def train(args: dict):
         save_dir = os.path.join(save_dir, run_tag)
     os.makedirs(save_dir, exist_ok=True)
     os.makedirs(os.path.join(save_dir, "results"), exist_ok=True)
+    # Capture git SHA
+    args['git_sha'] = get_git_sha()
     # Save the config used for this run
     with open(os.path.join(save_dir, "config.yaml"), "w") as f:
         yaml.dump(args, f, default_flow_style=False, sort_keys=False)
     print(f"Save dir: {save_dir}")
+    print(f"Git SHA: {args['git_sha']}")
 
     # ── MLflow ──
     use_mlflow = args.get("use_mlflow", False) and mlflow is not None
@@ -275,6 +278,7 @@ def train(args: dict):
         mlflow.set_experiment(args.get("project_name", "local-train"))
         mlflow.start_run(run_name=args.get("run_name"))
         mlflow.log_params({k: v for k, v in args.items() if isinstance(v, (str, int, float, bool))})
+        mlflow.set_tag('git_sha', args.get('git_sha', 'unknown'))
 
     # ── Training loop ──
     num_epochs = args.get("num_epochs", 10)
