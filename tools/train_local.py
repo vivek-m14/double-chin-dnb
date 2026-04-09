@@ -36,7 +36,7 @@ from tqdm import tqdm
 
 # ── Project imports ──
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.models.unet import BaseUNetHalf as UNet
+from src.models.unet import BaseUNetHalf, BaseUNetHalfLite
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
 from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint
@@ -205,7 +205,12 @@ def train(args: dict):
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     # ── Model ──
-    model = UNet(n_channels=3, n_classes=3).to(device)
+    ModelClass = BaseUNetHalfLite if args.get('model_variant', 'default') == 'lite' else BaseUNetHalf
+    model = ModelClass(
+        n_channels=3, n_classes=3,
+        last_layer_activation=args.get('last_layer_activation', 'sigmoid'),
+        blend_scale=args.get('blend_scale', 0.5),
+    ).to(device)
     params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {params:,} ({params/1e6:.1f}M)")
 

@@ -20,7 +20,7 @@ import numpy as np
 
 # Add the parent directory to the path so we can import from src
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.models.unet import BaseUNetHalf as UNet
+from src.models.unet import BaseUNetHalf, BaseUNetHalfLite
 from src.data.dataset import create_data_loaders
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
@@ -231,7 +231,12 @@ def train_skin_retouching_model(local_rank, world_size, args):
     
     print(f"Process {local_rank}: Creating model")
     # Create model
-    model = UNet(n_channels=3, n_classes=3)
+    ModelClass = BaseUNetHalfLite if args.get('model_variant', 'default') == 'lite' else BaseUNetHalf
+    model = ModelClass(
+        n_channels=3, n_classes=3,
+        last_layer_activation=args.get('last_layer_activation', 'sigmoid'),
+        blend_scale=args.get('blend_scale', 0.5),
+    )
     model = model.to(device)
     print(f"Process {local_rank}: Model created and moved to device")
 

@@ -18,7 +18,7 @@ import yaml
 # Add src to path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from models.unet import BaseUNetHalf
+from models.unet import BaseUNetHalf, BaseUNetHalfLite
 # from utils.utils import load_checkpoint
 # from blend.blend_map import apply_flow_formula
 
@@ -47,7 +47,10 @@ class DoubleChinRemover:
     def __init__(self, 
                  model_path: str,
                  device: str = 'auto',
-                 img_size: int = 1024):
+                 img_size: int = 1024,
+                 model_variant: str = 'default',
+                 last_layer_activation: str = 'sigmoid',
+                 blend_scale: float = 0.5):
         """
         Initialize the inference model
         
@@ -55,9 +58,15 @@ class DoubleChinRemover:
             model_path: Path to the trained model weights
             device: Device to run inference on ('cpu', 'cuda', or 'auto')
             img_size: Input image size for the model
+            model_variant: 'default' (BaseUNetHalf) or 'lite' (BaseUNetHalfLite)
+            last_layer_activation: 'sigmoid' or 'residual_tanh'
+            blend_scale: Scale for residual_tanh activation (default 0.5 = full [0,1])
         """
         self.model_path = model_path
         self.img_size = img_size
+        self.model_variant = model_variant
+        self.last_layer_activation = last_layer_activation
+        self.blend_scale = blend_scale
         
         # Set device
         if device == 'auto':
@@ -69,15 +78,16 @@ class DoubleChinRemover:
         # Initialize model
         self.model = self._load_model()
         
-    def _load_model(self) -> BaseUNetHalf:
+    def _load_model(self):
         """Load the trained model"""
-        # Initialize model (2 input channels for blend maps, 2 output channels for flow)
-        model = BaseUNetHalf(
+        ModelClass = BaseUNetHalfLite if self.model_variant == 'lite' else BaseUNetHalf
+        model = ModelClass(
             n_channels=3,  # RGB input
             n_classes=3,
             deep_supervision=False,
             init_weights=False,
-            last_layer_activation="sigmoid"  # Flow maps use tanh for [-1, 1] range
+            last_layer_activation=self.last_layer_activation,
+            blend_scale=self.blend_scale,
         )
         
         # Load trained weights

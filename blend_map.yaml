@@ -7,6 +7,11 @@ data_json: "/workspace/double_chin_data_v3/data_v3_data_final.json"
 # Reproducibility
 seed: 42
 
+# Model
+model_variant: 'lite'              # 'default' (BaseUNetHalf) or 'lite' (BaseUNetHalfLite — bilinear down/up, fewer layers)
+last_layer_activation: 'residual_tanh'  # 'sigmoid' or 'residual_tanh' (0.5 + scale*tanh, centered at neutral)
+blend_scale: 0.3                    # only for residual_tanh: 0.5 → [0,1], 0.3 → [0.2,0.8] (covers 99.93% of real data)
+
 # Training parameters
 num_epochs: 150
 batch_size: 8
@@ -39,6 +44,6 @@ port: 12350
 # MLflow logging
 test: false
 use_mlflow: true
-mlflow_tracking_uri: 'mlruns'   # Local directory or remote MLflow server URI
+mlflow_tracking_uri: 'http://mlflow.aftershoot.dev/'   # Local directory or remote MLflow server URI
 project_name: 'blend_maps_v3_2'  # MLflow experiment name
 run_name: ''                     # MLflow run name (empty = auto-generated)

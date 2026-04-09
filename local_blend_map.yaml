@@ -1,0 +1,41 @@
+# Local training config — smoke test on Apple Silicon (MPS)
+# Usage:  python tools/train_local.py --config local_blend_map.yaml
+
+# ── Dataset ──
+data_root: "/Users/vivekmittal/vk_ws/projects/double_chin/data/Double_Chin/double_chin_images"
+data_json: "/Users/vivekmittal/vk_ws/projects/double_chin/data/Double_Chin/double_chin_images/double_chin_data_v3/Double_Chin_double_chin_images_double_chin_data_v3_data_v3_data_final.json"
+
+# ── Model ──
+model_variant: 'default'   # 'default' or 'lite'
+
+# ── Training ──
+num_epochs: 2
+batch_size: 2
+learning_rate: 0.0001
+img_size: 512
+num_workers: 0            # 0 is safest on MPS; avoids fork/spawn issues
+pin_memory: false
+
+# ── Loss weights ──
+lambda_blend_mse: 1.0
+lambda_image_mse: 1.0
+lambda_perc: 0.1
+lambda_tv: 0.1
+
+# ── LR scheduler ──
+lr_step_size: 50
+lr_gamma: 0.1
+
+# ── Checkpoints ──
+save_dir: "weights-local"
+pretrained_path: ""       # train from scratch for smoke test
+save_interval: 1
+start_epoch: 0
+
+# ── Device ──
+device: "auto"            # auto → MPS on Apple Silicon
+
+# ── Logging ──
+test: true                # limits dataset to first 100 samples
+use_mlflow: false         # overridden by test=true anyway
+project_name: "local_smoke"
