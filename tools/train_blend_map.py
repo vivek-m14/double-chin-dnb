@@ -213,16 +213,23 @@ def train_skin_retouching_model(local_rank, world_size, args):
     torch.cuda.set_device(local_rank)
     print(f"Process {local_rank}: Set device to {device}")
     
-    # Initialize MLflow for the main process
+    # Initialize MLflow for the main process (non-fatal — training continues without it)
+    mlflow_active = False
     if local_rank == 0 and args.get('use_mlflow', True):
-        mlflow.set_tracking_uri(args.get('mlflow_tracking_uri', 'mlruns'))
-        mlflow.set_experiment(args['project_name'])
-        mlflow.start_run(run_name=args.get('run_name', None))
-        mlflow.log_params({
-            k: v for k, v in args.items()
-            if isinstance(v, (str, int, float, bool))
-        })
-        mlflow.set_tag('git_sha', args.get('git_sha', 'unknown'))
+        try:
+            mlflow.set_tracking_uri(args.get('mlflow_tracking_uri', 'mlruns'))
+            mlflow.set_experiment(args['project_name'])
+            mlflow.start_run(run_name=args.get('run_name', None))
+            mlflow.log_params({
+                k: v for k, v in args.items()
+                if isinstance(v, (str, int, float, bool))
+            })
+            mlflow.set_tag('git_sha', args.get('git_sha', 'unknown'))
+            mlflow_active = True
+            print("MLflow initialized successfully")
+        except Exception as e:
+            print(f"WARNING: MLflow init failed ({e}). Training will continue without MLflow.", flush=True)
+            mlflow_active = False
     
     print(f"Process {local_rank}: Creating data loaders")
     # Create data loaders
@@ -371,15 +378,18 @@ def train_skin_retouching_model(local_rank, world_size, args):
         # Log training results
         if local_rank == 0:
             print(f"\nEpoch [{epoch + 1}/{num_epochs}], Training Loss: {train_losses['total_loss']:.4f}")
-            if args.get('use_mlflow', True):
-                mlflow.log_metrics({
-                    'train_loss': train_losses['total_loss'],
-                    'train_blend_map_loss': train_losses['blend_map_loss'],
-                    'train_image_mse_loss': train_losses['image_mse_loss'],
-                    'train_perc_loss': train_losses['perc_loss'],
-                    'train_tv_loss': train_losses['tv_loss'],
-                    'lr': optimizer.param_groups[0]['lr'],
-                }, step=epoch + 1)
+            if mlflow_active:
+                try:
+                    mlflow.log_metrics({
+                        'train_loss': train_losses['total_loss'],
+                        'train_blend_map_loss': train_losses['blend_map_loss'],
+                        'train_image_mse_loss': train_losses['image_mse_loss'],
+                        'train_perc_loss': train_losses['perc_loss'],
+                        'train_tv_loss': train_losses['tv_loss'],
+                        'lr': optimizer.param_groups[0]['lr'],
+                    }, step=epoch + 1)
+                except Exception:
+                    pass
         
         # Validate
         test_results = validate(
@@ -393,15 +403,18 @@ def train_skin_retouching_model(local_rank, world_size, args):
             print(f"Average Testing Loss: {test_results['total_loss']:.4f}")
             print(f"Average PSNR: {test_results['psnr']:.2f} dB")
             
-            if args.get('use_mlflow', True):
-                mlflow.log_metrics({
-                    'test_loss': test_results['total_loss'],
-                    'test_blend_map_loss': test_results['blend_map_loss'],
-                    'test_image_mse_loss': test_results['image_mse_loss'],
-                    'test_perc_loss': test_results['perc_loss'],
-                    'test_tv_loss': test_results['tv_loss'],
-                    'test_psnr': test_results['psnr'],
-                }, step=epoch + 1)
+            if mlflow_active:
+                try:
+                    mlflow.log_metrics({
+                        'test_loss': test_results['total_loss'],
+                        'test_blend_map_loss': test_results['blend_map_loss'],
+                        'test_image_mse_loss': test_results['image_mse_loss'],
+                        'test_perc_loss': test_results['perc_loss'],
+                        'test_tv_loss': test_results['tv_loss'],
+                        'test_psnr': test_results['psnr'],
+                    }, step=epoch + 1)
+                except Exception:
+                    pass
             
             # CSV logging (always, even if MLflow is off)
             csv_logger.log_epoch(
@@ -446,9 +459,12 @@ def train_skin_retouching_model(local_rank, world_size, args):
         print("Finished Training")
         print(f"Best model was from epoch {best_epoch} with test loss: {best_test_loss:.4f}")
         
-        if args.get('use_mlflow', True):
-            mlflow.log_artifact(f'{save_dir}/checkpoint_best.pth')
-            mlflow.end_run()
+        if mlflow_active:
+            try:
+                mlflow.log_artifact(f'{save_dir}/checkpoint_best.pth')
+                mlflow.end_run()
+            except Exception as e:
+                print(f"WARNING: MLflow finalization failed: {e}")
 
 
 def main_worker(local_rank, world_size, args):

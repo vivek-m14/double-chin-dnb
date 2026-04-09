@@ -44,6 +44,6 @@ port: 12350
 # MLflow logging
 test: false
 use_mlflow: true
-mlflow_tracking_uri: 'http://mlflow.aftershoot.dev/'   # Local directory or remote MLflow server URI
+mlflow_tracking_uri: 'https://mlflow.aftershoot.dev/'  # Local directory or remote MLflow server URI
 project_name: 'blend_maps_v3_2'  # MLflow experiment name
 run_name: ''                     # MLflow run name (empty = auto-generated)

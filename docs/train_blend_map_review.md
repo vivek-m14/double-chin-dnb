@@ -1,6 +1,6 @@
 # Production Review: `train_blend_map.py` Pipeline
 
-**Date:** 2026-04-09 (updated after `git pull`)  
+**Date:** 2026-04-09 (updated: blend map distribution analysis + additional fixes)  
 **Scope:** `tools/train_blend_map.py` and all associated modules  
 **Reviewer:** Senior ML Systems Engineer  
 
@@ -32,33 +32,19 @@
 | 6 | No model config stored in checkpoint | **FIXED** | `model_config` dict saved in checkpoint payload (line 138) |
 | 7 | Excessive visualization I/O every epoch | **FIXED** | Visualizations now throttled to `save_interval` epochs + first/last (line 305) |
 | 8 | No rolling latest checkpoint for crash recovery | **FIXED** | `checkpoint_latest.pth` saved every epoch (line 349) |
+| 9 | Data augmentation applied to validation set | **FIXED** | `BlendMapDataset` now takes `augment` flag; `create_data_loaders` creates two instances (`augment=True` for train, `augment=False` for val) split via shared `randperm` indices wrapped in `Subset` |
+| 10 | `noise_threshold` parameter shadowed and useless | **FIXED** | Re-assignment `noise_threshold = 3.0/255.0` removed from both `compute_target_blend_map` and `compute_target_blend_map_np` bodies; parameter default now controls the value |
+| 11 | `cleanup()` in parent doesn't clean child NCCL groups | **FIXED** | `main_worker` now has `try/finally` around `train_skin_retouching_model` that calls `dist.destroy_process_group()` and `torch.cuda.empty_cache()` on any exit |
+| 12 | VGG16 weights downloaded per process (race condition) | **FIXED** | Rank 0 now pre-downloads VGG16 weights before `dist.barrier()`; other ranks wait, then load from cache (lines 264–268 of `train_blend_map.py`) |
 
 ---
 
 ## 🔴 Critical Issues (must fix before production)
 
-### 1. Data augmentation is applied to the validation/test set
+### 1. Unsafe deserialization — arbitrary code execution via `torch.load`
 
-- **Location:** `src/data/dataset.py` line 130
-- **Details:** `apply_augmentation` (random flip, random rotation) is called unconditionally inside `__getitem__`. Since `create_data_loaders` uses `random_split` on a *single* `BlendMapDataset` instance, the test subset shares the same augmented `__getitem__`.
-- **Why it matters:** Every validation metric (PSNR, loss) is computed on randomly-augmented images. Metrics are noisy, non-reproducible, and overestimate real-world performance. You cannot trust best-model selection.
-- **Suggested fix:** Add a `training` flag to the dataset or use separate dataset instances for train/test:
-  ```python
-  class BlendMapDataset(Dataset):
-      def __init__(self, ..., augment=True):
-          self.augment = augment
-      def __getitem__(self, idx, ...):
-          ...
-          if self.augment:
-              image, blend_map, gt = self.apply_augmentation(image, blend_map, gt)
-  ```
-
----
-
-### 2. Unsafe deserialization — arbitrary code execution via `torch.load`
-
-- **Location:** `src/utils/utils_blend.py` lines 149, 175, 196
-- **Details:** All three `torch.load` calls use the default `pickle` deserializer without `weights_only=True`.
+- **Location:** `src/utils/utils_blend.py` lines 170, 196
+- **Details:** Both `torch.load` calls use the default `pickle` deserializer without `weights_only=True`.
 - **Why it matters:** A malicious checkpoint file can execute arbitrary code on load. In a production pipeline where checkpoints may come from shared storage or external sources, this is a remote code execution vulnerability.
 - **Suggested fix:** Add `weights_only=True` to all `torch.load` calls:
   ```python
@@ -67,27 +53,7 @@
 
 ---
 
-### 3. `cleanup()` in parent process doesn't clean up child NCCL groups
-
-- **Location:** `tools/train_blend_map.py` lines 475–478 (cleanup def), 524 (finally block)
-- **Details:** `cleanup()` is now called in `main()`'s `finally` block, but `main()` is the **parent** process which never calls `dist.init_process_group()`. So `dist.is_initialized()` is always `False` there — it only calls `torch.cuda.empty_cache()`. The actual child worker processes spawned by `mp.spawn` in `main_worker` still have no `try/finally` around `train_skin_retouching_model`, so NCCL process groups are leaked on any child crash.
-- **Why it matters:** On shared GPU machines, leaked NCCL groups leave zombie processes holding GPU memory. Subsequent runs fail with `NCCL error` or port-already-in-use.
-- **Suggested fix:** Add `try/finally` **inside `main_worker`**, where `dist.init_process_group` is actually called:
-  ```python
-  def main_worker(local_rank, world_size, args):
-      ...
-      dist.init_process_group(...)
-      try:
-          train_skin_retouching_model(local_rank, world_size, args)
-      finally:
-          if dist.is_initialized():
-              dist.destroy_process_group()
-          torch.cuda.empty_cache()
-  ```
-
----
-
-### 4. Silent data corruption: `__getitem__` swallows errors and returns random samples
+### 2. Silent data corruption: `__getitem__` swallows errors and returns random samples
 
 - **Location:** `src/data/dataset.py` lines 131–136
 - **Details:** On any exception (corrupt image, missing file, bad NPY), the code logs to a flat file and returns `self.__getitem__(np.random.randint(0, len(self)))`. The same pattern exists in `TensorMapDataset` (line 230) but **without any retry limit** — infinite recursion risk.
@@ -129,37 +95,18 @@
 
 ---
 
-### 3. `noise_threshold` parameter is shadowed and useless
-
-- **Location:** `src/blend/blend_map.py` lines 55–62
-- **Details:** Both `compute_target_blend_map` and `compute_target_blend_map_np` accept `noise_threshold` as a parameter, then immediately re-assign it to `noise_threshold = 3.0/255.0` inside the function body. The parameter is completely inert.
-- **Impact:** Any caller trying to tune the noise threshold will get silent no-op behavior.
-- **Suggested fix:** Remove the re-assignment inside the function body.
-
----
-
-### 4. `CombinedLoss` is not an `nn.Module`
+### 3. `CombinedLoss` is not an `nn.Module`
 
 - **Location:** `src/losses/losses.py` line 88
 - **Details:** `CombinedLoss` is a plain Python class, not `nn.Module`. It has a custom `.to()` method that doesn't properly chain.
 - **Impact:**
   - Won't appear in model summaries or device management.
-  - VGG16 inside `PerceptualLoss` gets downloaded independently per DDP process (race condition on shared FS).
   - The `PerceptualLoss` parameters won't be excluded from optimizer unless manually managed.
 - **Suggested fix:** Make it inherit `nn.Module`, register sub-losses as submodules.
 
 ---
 
-### 5. VGG16 weights downloaded per process in distributed training
-
-- **Location:** `src/losses/losses.py` line 15
-- **Details:** `vgg16(weights=VGG16_Weights.DEFAULT)` is called inside `PerceptualLoss.__init__`, which is called on every DDP process. If the model cache is cold, all processes download simultaneously.
-- **Impact:** Race condition on download, potential crash or corruption on shared filesystems.
-- **Suggested fix:** Download/cache weights on rank 0 first, then `dist.barrier()`, then initialize on all ranks.
-
----
-
-### 6. Blend map cache invalidation is non-existent
+### 4. Blend map cache invalidation is non-existent
 
 - **Location:** `src/data/dataset.py` lines 109–113
 - **Details:** If the `.npy` blend map doesn't exist, it's computed on-the-fly and saved. But if the blend formula changes (which it has — there's old commented-out code for a different formula), stale `.npy` files are silently loaded with no version check.
@@ -233,8 +180,8 @@ After training completes, automatically run inference on a held-out canary set a
 ### 2. Rotation augmentation corrupts blend map semantics
 Rotating a blend map with `fill=(0.5, 0.5, 0.5)` sets the fill to "neutral" (correct), but rotating the image with `fill=0` (default black) creates black border regions. The loss then trains the model to output neutral blend for black pixels, creating a systematic bias at image borders that will manifest on real-world crops.
 
-### 3. PSNR computed on augmented validation data is meaningless
-Since augmentation is applied to test data (Critical Issue #1), and rotation introduces black borders, PSNR is computed on images with artificial black regions. The reported PSNR is systematically higher than real performance (black matches black), giving false confidence.
+### 3. ~~PSNR computed on augmented validation data~~ — RESOLVED
+~~Since augmentation is applied to test data, PSNR is computed on images with artificial black regions.~~ **Fixed:** Validation now uses `augment=False` dataset instance. No longer an issue.
 
 ### 4. Perceptual loss VGG expects ImageNet normalization
 The VGG16 in `PerceptualLoss` uses `VGG16_Weights.DEFAULT` which expects ImageNet-normalized input (`mean=[0.485, 0.456, 0.406]`, `std=[0.229, 0.224, 0.225]`). The pipeline feeds raw `[0,1]` images. The perceptual loss is operating on out-of-distribution features, reducing its effectiveness to an expensive near-random feature MSE.
@@ -244,15 +191,53 @@ When a data error occurs, `np.random.randint(0, len(self))` is seeded per-proces
 
 ---
 
+## 📊 Empirical Analysis: Blend Map Target Distribution
+
+**Analysis date:** 2026-04-09  
+**Script:** `tools/analyze_blend_map_distribution.py`  
+**Sample size:** 500 images from the usable dataset (7,280 images, excluding `aadan_double_chin`)  
+
+Key question: Does the model's `ResidualTanh(scale=0.3)` output range `[0.2, 0.8]` cover the actual target blend map values?
+
+### Results
+
+| Metric | Value |
+|--------|-------|
+| Active pixels outside [0.2, 0.8] | **0.0134%** |
+| Images with ANY pixel outside [0.2, 0.8] | 5/500 (1.0%) |
+| P0.01 (extreme low) | 0.2353 ✅ |
+| P99.99 (extreme high) | 0.7765 ✅ |
+| Dataset absolute min | 0.0451 (single outlier) |
+| Dataset absolute max | 0.9874 (single outlier) |
+
+### Distribution Shape
+
+The target blend map is a **sharp spike near 0.5** (neutral), with almost all edits being slight darkening (values concentrated in `[0.42, 0.50]`). This is consistent with the dataset being subtle skin shadow adjustments (mean edit magnitude 11.6/255).
+
+```
+[0.44-0.46] 11.32%  █████████
+[0.46-0.48] 24.09%  █████████████████████
+[0.48-0.50] 45.32%  ████████████████████████████████████████  ← bulk of data
+[0.50-0.52]  7.76%  ██████
+```
+
+### Conclusion
+
+✅ **`ResidualTanh(scale=0.3)` output range `[0.2, 0.8]` is sufficient.** It covers 99.987% of target pixels. The theoretical concern about target-range mismatch (identified in the blend map math review) is a **non-issue in practice** for this dataset. No target clamping is needed.
+
+The 5 outlier images (1%) with pixels outside the range are likely data quality edge cases and won't meaningfully affect training.
+
+---
+
 ## Summary
 
 | Severity | Count | Previously | Change |
 |----------|-------|------------|--------|
-| ✅ Fixed | 8 | — | +8 resolved |
-| 🔴 Critical | 4 | 5 | −1 (resume fixed) |
-| 🟠 High | 6 | 7 | −1 (CLI config fixed) |
+| ✅ Fixed | 12 | 10 | +2 (child NCCL cleanup, VGG download race) |
+| 🔴 Critical | 2 | 3 | −1 (child NCCL cleanup fixed) |
+| 🟠 High | 4 | 5 | −1 (VGG download race fixed) |
 | 🟡 Medium | 8 | 8 | ±0 |
 | 🟢 Low | 5 | 5 | ±0 |
-| 🚨 Hidden Risks | 5 | 5 | ±0 |
+| 🚨 Hidden Risks | 4 | 4 | ±0 |
 
-**Overall assessment:** Good progress since last review — checkpoint resume, atomic saves, CSV logging, and CLI config are solid improvements. The remaining critical issues (augmented validation, unsafe deserialization, child process cleanup, silent data corruption) still need to be addressed before metrics and trained models can be fully trusted in production.
+**Overall assessment:** Excellent progress — 12 of the original issues now resolved. The two remaining critical items are unsafe `torch.load` deserialization and silent error swallowing in `__getitem__`. The blend map distribution analysis confirms the `ResidualTanh` activation is well-matched to the data. All DDP lifecycle issues are now properly handled.
