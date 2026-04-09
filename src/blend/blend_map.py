@@ -60,8 +60,6 @@ def compute_target_blend_map(original, retouched, noise_threshold=3.0/255.0):
         
     blend_map = (retouched - original + 1) / 2
     
-    # Noise threshold
-    noise_threshold = 3.0/255.0
     diff = torch.abs(retouched - original)
     mask_noise = diff < noise_threshold
     
@@ -84,8 +82,6 @@ def compute_target_blend_map_np(original, retouched, noise_threshold=3.0/255.0):
         
     blend_map = (retouched - original + 1) / 2
     
-    # Noise threshold
-    noise_threshold = 3.0/255.0
     diff = np.abs(retouched - original)
     mask_noise = diff < noise_threshold
     
