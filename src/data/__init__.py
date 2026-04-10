@@ -1,2 +1,2 @@
 # Data module
-from src.data.dataset import TensorMapDataset, create_data_loaders
+from src.data.dataset import BlendMapDataset, TensorMapDataset, create_data_loaders
