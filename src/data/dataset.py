@@ -102,6 +102,9 @@ class BlendMapDataset(Dataset):
                 ),
                 A.RandomToneCurve(scale=0.15, p=0.2),
                 A.ToGray(p=0.1),
+
+                # ── Degradation (simulate real-world compression) ──
+                A.ImageCompression(quality_lower=40, quality_upper=95, p=0.3),
             ], additional_targets={'gt': 'image'})
         else:
             self.aug = None
