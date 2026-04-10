@@ -47,7 +47,8 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
         dict: Dictionary of average losses
     """
     model.train()
-    running_losses = {'total_loss': 0.0, 'blend_map_loss': 0.0, 
+    running_losses = {'total_loss': 0.0, 'blend_map_loss': 0.0,
+                    'blend_masked_loss': 0.0, 'blend_unmasked_loss': 0.0,
                     'image_mse_loss': 0.0, 'perc_loss': 0.0, 'tv_loss': 0.0}
     
     if local_rank == 0:
@@ -114,9 +115,10 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
         dict: Dictionary of average losses and metrics
     """
     model.eval()
-    running_losses = {'total_loss': 0.0, 'blend_map_loss': 0.0, 
+    running_losses = {'total_loss': 0.0, 'blend_map_loss': 0.0,
+                    'blend_masked_loss': 0.0, 'blend_unmasked_loss': 0.0,
                     'image_mse_loss': 0.0, 'perc_loss': 0.0, 'tv_loss': 0.0}
-    running_metrics = {'psnr': 0.0}
+    running_metrics = {'psnr': 0.0, 'ssim': 0.0}
     
     if local_rank == 0:
         test_bar = tqdm(enumerate(test_loader), total=len(test_loader), 
@@ -233,6 +235,19 @@ def train_skin_retouching_model(local_rank, world_size, args):
             mlflow_active = False
     
     print(f"Process {local_rank}: Creating data loaders")
+    # On resume, load the saved data fingerprint for drift detection
+    resume_path = args.get('resume_path', '')
+    if resume_path and os.path.isfile(resume_path):
+        saved_cfg_path = os.path.join(
+            os.path.dirname(os.path.abspath(resume_path)), 'config.yaml'
+        )
+        if os.path.isfile(saved_cfg_path):
+            with open(saved_cfg_path, 'r') as _f:
+                saved_cfg = yaml.safe_load(_f) or {}
+            if 'data_fingerprint' in saved_cfg:
+                args['data_fingerprint'] = saved_cfg['data_fingerprint']
+                if local_rank == 0:
+                    print(f"  Loaded saved data fingerprint for drift check")
     # Create data loaders
     train_loader, test_loader, train_sampler, _ = create_data_loaders(
         args, world_size=world_size, rank=local_rank, test=args.get('test', False)
@@ -277,10 +292,13 @@ def train_skin_retouching_model(local_rank, world_size, args):
 
     # Create loss function
     criterion = CombinedLoss(
-        lambda_blend_mse=args.get('lambda_blend_mse', 1.0),
-        lambda_image_mse=args.get('lambda_image_mse', 1.0),
+        lambda_blend=args.get('lambda_blend', 1.0),
+        lambda_blend_masked=args.get('lambda_blend_masked', 1.0),
+        lambda_blend_unmasked=args.get('lambda_blend_unmasked', 0.0),
+        lambda_image_mse=args.get('lambda_image_mse', 0.0),
         lambda_perc=args.get('lambda_perc', 0.1),
-        lambda_tv=args.get('lambda_tv', 0.1)
+        lambda_tv=args.get('lambda_tv', 0.1),
+        blend_mask_threshold=args.get('blend_mask_threshold', 0.02),
     ).to(device)  # Explicitly move criterion to device
     
     # Create optimizer and scheduler (on raw model, before DDP)
@@ -301,7 +319,11 @@ def train_skin_retouching_model(local_rank, world_size, args):
     
     # Resume from full checkpoint BEFORE DDP wrapping
     best_test_loss = float('inf')
+    best_psnr = 0.0
+    best_ssim = 0.0
     best_epoch = -1
+    best_psnr_epoch = -1
+    best_ssim_epoch = -1
     start_epoch = args.get('start_epoch', 0)
     resume_path = args.get('resume_path', '')
     if resume_path and os.path.isfile(resume_path):
@@ -309,9 +331,13 @@ def train_skin_retouching_model(local_rank, world_size, args):
         model = ckpt['model'].to(device)
         start_epoch = ckpt['start_epoch']
         best_test_loss = ckpt['best_val_loss']
+        best_psnr = ckpt.get('best_psnr', 0.0)
+        best_ssim = ckpt.get('best_ssim', 0.0)
         best_epoch = start_epoch  # approximate — the true best epoch isn't stored
+        best_psnr_epoch = start_epoch
+        best_ssim_epoch = start_epoch
         if local_rank == 0:
-            print(f"Resuming from epoch {start_epoch}, best_val_loss={best_test_loss:.4f}")
+            print(f"Resuming from epoch {start_epoch}, best_val_loss={best_test_loss:.4f}, best_psnr={best_psnr:.2f}, best_ssim={best_ssim:.4f}")
 
     # Flush any pending CUDA errors and sync all ranks before DDP
     try:
@@ -389,6 +415,8 @@ def train_skin_retouching_model(local_rank, world_size, args):
                     mlflow.log_metrics({
                         'train_loss': train_losses['total_loss'],
                         'train_blend_map_loss': train_losses['blend_map_loss'],
+                        'train_blend_masked_loss': train_losses['blend_masked_loss'],
+                        'train_blend_unmasked_loss': train_losses['blend_unmasked_loss'],
                         'train_image_mse_loss': train_losses['image_mse_loss'],
                         'train_perc_loss': train_losses['perc_loss'],
                         'train_tv_loss': train_losses['tv_loss'],
@@ -408,16 +436,20 @@ def train_skin_retouching_model(local_rank, world_size, args):
             print(f"\nTesting Statistics:")
             print(f"Average Testing Loss: {test_results['total_loss']:.4f}")
             print(f"Average PSNR: {test_results['psnr']:.2f} dB")
+            print(f"Average SSIM: {test_results['ssim']:.4f}")
             
             if mlflow_active:
                 try:
                     mlflow.log_metrics({
                         'test_loss': test_results['total_loss'],
                         'test_blend_map_loss': test_results['blend_map_loss'],
+                        'test_blend_masked_loss': test_results['blend_masked_loss'],
+                        'test_blend_unmasked_loss': test_results['blend_unmasked_loss'],
                         'test_image_mse_loss': test_results['image_mse_loss'],
                         'test_perc_loss': test_results['perc_loss'],
                         'test_tv_loss': test_results['tv_loss'],
                         'test_psnr': test_results['psnr'],
+                        'test_ssim': test_results['ssim'],
                     }, step=epoch + 1)
                 except Exception:
                     pass
@@ -431,23 +463,74 @@ def train_skin_retouching_model(local_rank, world_size, args):
                 epoch_time=time.time() - epoch_start_time,
             )
 
-            # Save best model
+            # Save best model (lowest loss)
             if test_results['total_loss'] < best_test_loss:
                 best_test_loss = test_results['total_loss']
                 best_epoch = epoch + 1
                 save_full_checkpoint(
                     f"{save_dir}/checkpoint_best.pth",
                     model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
-                    model_config=model_config,
+                    model_config=model_config, best_psnr=best_psnr, best_ssim=best_ssim,
                 )
                 print(f"New best model saved! (Epoch {best_epoch}, Loss: {best_test_loss:.4f})")
+            
+            # Save best PSNR model
+            if test_results['psnr'] > best_psnr:
+                best_psnr = test_results['psnr']
+                best_psnr_epoch = epoch + 1
+                save_full_checkpoint(
+                    f"{save_dir}/checkpoint_best_psnr.pth",
+                    model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
+                    model_config=model_config, best_psnr=best_psnr, best_ssim=best_ssim,
+                )
+                print(f"New best PSNR model saved! (Epoch {best_psnr_epoch}, PSNR: {best_psnr:.2f} dB)")
+            
+            # Save best SSIM model
+            if test_results['ssim'] > best_ssim:
+                best_ssim = test_results['ssim']
+                best_ssim_epoch = epoch + 1
+                save_full_checkpoint(
+                    f"{save_dir}/checkpoint_best_ssim.pth",
+                    model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
+                    model_config=model_config, best_psnr=best_psnr, best_ssim=best_ssim,
+                )
+                print(f"New best SSIM model saved! (Epoch {best_ssim_epoch}, SSIM: {best_ssim:.4f})")
+            
+            # Early stopping: no improvement in ANY metric for `patience` epochs
+            epochs_since_improvement = min(
+                (epoch + 1) - best_epoch if best_epoch > 0 else 0,
+                (epoch + 1) - best_psnr_epoch if best_psnr_epoch > 0 else 0,
+                (epoch + 1) - best_ssim_epoch if best_ssim_epoch > 0 else 0,
+            )
+            patience = args.get('early_stopping_patience', 30)  # 0 = disabled
+            if patience > 0 and epochs_since_improvement >= patience:
+                print(f"\nEarly stopping triggered! No improvement for {patience} epochs.")
+                print(f"  Best loss: {best_test_loss:.4f} (epoch {best_epoch})")
+                print(f"  Best PSNR: {best_psnr:.2f} dB (epoch {best_psnr_epoch})")
+                print(f"  Best SSIM: {best_ssim:.4f} (epoch {best_ssim_epoch})")
             
             # Rolling latest checkpoint (overwritten every epoch for crash recovery)
             save_full_checkpoint(
                 f"{save_dir}/checkpoint_latest.pth",
                 model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
-                model_config=model_config,
+                model_config=model_config, best_psnr=best_psnr, best_ssim=best_ssim,
             )
+        
+        # Broadcast early stopping decision to all ranks to avoid DDP deadlock
+        should_stop = torch.zeros(1, device=device)
+        if local_rank == 0:
+            patience = args.get('early_stopping_patience', 30)
+            if patience > 0:
+                epochs_since = min(
+                    (epoch + 1) - best_epoch if best_epoch > 0 else 0,
+                    (epoch + 1) - best_psnr_epoch if best_psnr_epoch > 0 else 0,
+                    (epoch + 1) - best_ssim_epoch if best_ssim_epoch > 0 else 0,
+                )
+                if epochs_since >= patience:
+                    should_stop.fill_(1.0)
+        dist.broadcast(should_stop, src=0)
+        if should_stop.item() > 0:
+            break
         
         # Update learning rate
         scheduler.step()
@@ -463,7 +546,9 @@ def train_skin_retouching_model(local_rank, world_size, args):
         if csv_logger:
             csv_logger.close()
         print("Finished Training")
-        print(f"Best model was from epoch {best_epoch} with test loss: {best_test_loss:.4f}")
+        print(f"Best model (loss) was from epoch {best_epoch} with test loss: {best_test_loss:.4f}")
+        print(f"Best model (PSNR) was from epoch {best_psnr_epoch} with PSNR: {best_psnr:.2f} dB")
+        print(f"Best model (SSIM) was from epoch {best_ssim_epoch} with SSIM: {best_ssim:.4f}")
         
         if mlflow_active:
             try:
@@ -560,7 +645,8 @@ def main():
         run_tag = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         config['save_dir'] = os.path.join(base_save_dir, run_tag)
     else:
-        config['save_dir'] = base_save_dir
+        # Resume into the same directory that contains the checkpoint
+        config['save_dir'] = os.path.dirname(os.path.abspath(config['resume_path']))
     
     # Add distributed training parameters
     world_size = torch.cuda.device_count()

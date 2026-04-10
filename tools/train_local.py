@@ -121,7 +121,8 @@ def train_one_epoch(
     num_epochs: int,
 ) -> dict:
     model.train()
-    running = {k: 0.0 for k in ("total_loss", "blend_map_loss", "image_mse_loss", "perc_loss", "tv_loss")}
+    running = {k: 0.0 for k in ("total_loss", "blend_map_loss", "blend_masked_loss", "blend_unmasked_loss",
+                                   "image_mse_loss", "perc_loss", "tv_loss")}
 
     bar = tqdm(loader, desc=f"Train [{epoch+1}/{num_epochs}]", leave=False)
     for batch in bar:
@@ -155,7 +156,8 @@ def validate(
     save_dir: str | None = None,
 ) -> dict:
     model.eval()
-    running = {k: 0.0 for k in ("total_loss", "blend_map_loss", "image_mse_loss", "perc_loss", "tv_loss")}
+    running = {k: 0.0 for k in ("total_loss", "blend_map_loss", "blend_masked_loss", "blend_unmasked_loss",
+                                   "image_mse_loss", "perc_loss", "tv_loss")}
     running_psnr = 0.0
 
     bar = tqdm(loader, desc=f"Val   [{epoch+1}/{num_epochs}]", leave=False)
@@ -231,10 +233,13 @@ def train(args: dict):
 
     # ── Loss / Optim / Scheduler ──
     criterion = CombinedLoss(
-        lambda_blend_mse=args.get("lambda_blend_mse", 1.0),
+        lambda_blend=args.get("lambda_blend", 1.0),
+        lambda_blend_masked=args.get("lambda_blend_masked", 1.0),
+        lambda_blend_unmasked=args.get("lambda_blend_unmasked", 0.0),
         lambda_image_mse=args.get("lambda_image_mse", 1.0),
         lambda_perc=args.get("lambda_perc", 0.1),
         lambda_tv=args.get("lambda_tv", 0.1),
+        blend_mask_threshold=args.get("blend_mask_threshold", 0.02),
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=args.get("learning_rate", 1e-4))

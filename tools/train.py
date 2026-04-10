@@ -43,7 +43,8 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
         dict: Dictionary of average losses
     """
     model.train()
-    running_losses = {'total_loss': 0.0, 'tensor_map_loss': 0.0, 
+    running_losses = {'total_loss': 0.0, 'tensor_map_loss': 0.0,
+                    'blend_masked_loss': 0.0, 'blend_unmasked_loss': 0.0,
                     'image_mse_loss': 0.0, 'perc_loss': 0.0, 'tv_loss': 0.0}
     
     if local_rank == 0:
@@ -109,7 +110,8 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
         dict: Dictionary of average losses and metrics
     """
     model.eval()
-    running_losses = {'total_loss': 0.0, 'tensor_map_loss': 0.0, 
+    running_losses = {'total_loss': 0.0, 'tensor_map_loss': 0.0,
+                    'blend_masked_loss': 0.0, 'blend_unmasked_loss': 0.0,
                     'image_mse_loss': 0.0, 'perc_loss': 0.0, 'tv_loss': 0.0}
     running_metrics = {'psnr': 0.0}
     
@@ -249,10 +251,13 @@ def train_skin_retouching_model(local_rank, world_size, args):
     
     # Create loss function
     criterion = CombinedLoss(
-        lambda_blend_mse=args.get('lambda_blend_mse', 1.0),
+        lambda_blend=args.get('lambda_blend', 1.0),
+        lambda_blend_masked=args.get('lambda_blend_masked', 1.0),
+        lambda_blend_unmasked=args.get('lambda_blend_unmasked', 0.0),
         lambda_image_mse=args.get('lambda_image_mse', 1.0),
         lambda_perc=args.get('lambda_perc', 0.1),
-        lambda_tv=args.get('lambda_tv', 0.1)
+        lambda_tv=args.get('lambda_tv', 0.1),
+        blend_mask_threshold=args.get('blend_mask_threshold', 0.02),
     ).to(device)  # Explicitly move criterion to device
     
     # Create optimizer and scheduler
@@ -292,6 +297,8 @@ def train_skin_retouching_model(local_rank, world_size, args):
             wandb_log = {
                 'train_loss': train_losses['total_loss'],
                 'train_tensor_map_loss': train_losses['tensor_map_loss'],
+                'train_blend_masked_loss': train_losses['blend_masked_loss'],
+                'train_blend_unmasked_loss': train_losses['blend_unmasked_loss'],
                 'train_image_mse_loss': train_losses['image_mse_loss'],
                 'train_perc_loss': train_losses['perc_loss'],
                 'train_tv_loss': train_losses['tv_loss'],
@@ -318,6 +325,8 @@ def train_skin_retouching_model(local_rank, world_size, args):
                 wandb_log = {
                     'test_loss': test_results['total_loss'],
                     'test_tensor_map_loss': test_results['tensor_map_loss'],
+                    'test_blend_masked_loss': test_results['blend_masked_loss'],
+                    'test_blend_unmasked_loss': test_results['blend_unmasked_loss'],
                     'test_image_mse_loss': test_results['image_mse_loss'],
                     'test_perc_loss': test_results['perc_loss'],
                     'test_tv_loss': test_results['tv_loss'],
