@@ -84,14 +84,15 @@ Two new components for the blend-map prediction task.
 
 ---
 
-## 8. P0 Fixes — Loss & Optimization
+## 8. P0 Fixes — Loss, Optimization & Validation
 
-**Files:** `src/losses/losses.py`, `tools/train_blend_map.py`
+**Files:** `src/losses/losses.py`, `src/data/dataset.py`, `tools/train_blend_map.py`
 
-Two critical correctness fixes identified during adversarial code review.
+Three critical correctness fixes identified during adversarial code review.
 
 - **VGG ImageNet normalization** — `PerceptualLoss.forward()` now normalizes inputs with `mean=[0.485, 0.456, 0.406]`, `std=[0.229, 0.224, 0.225]` before extracting VGG16 features. Previously raw [0, 1] images were fed directly, making deeper VGG layers (slice3, slice4) produce meaningless features and corrupting the perceptual gradient signal.
 - **Gradient clipping** — `torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)` added between `loss.backward()` and `optimizer.step()`. Prevents gradient spikes from perceptual loss outliers from destabilizing Adam's momentum estimates.
+- **Augmentations disabled for validation** — Previously the same augmented dataset was used for both training and validation, meaning val metrics were computed on randomly flipped/rotated inputs. This made val loss noisy and unreliable for model selection (best checkpoint). Fixed by creating separate dataset instances: `BlendMapDataset(..., augment=True)` for train, `BlendMapDataset(..., augment=False)` for val.
 
 ---
 

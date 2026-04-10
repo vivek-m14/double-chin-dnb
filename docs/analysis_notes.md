@@ -590,3 +590,86 @@ PyTorch MPS std is 0.2 ms (pure GPU, rock-steady), while CoreML std is 5–6 ms 
 - Blend map approach (validated by data analysis)
 - Image resolution (1024×1024)
 - Loss function structure (4-term combination is good, just tune weights)
+
+---
+
+## 10. Warping Analysis — v3 Dataset (April 2026)
+
+### Purpose
+
+Detect and quantify **geometric warping** (spatial distortion) introduced by the editing pipeline in original→edited image pairs. Shadow/brightness-only changes must not be confused with geometric distortion.
+
+### Methodology
+
+A two-factor classification system in `tools/analyze_warping.py`:
+
+1. **Edit-region optical flow** — Farneback dense flow computed only within the edit mask (difference between original and edited, thresholded). Gives `edit_flow_mean`, `edit_flow_p95`, `edit_pct_over_1px`, etc.
+2. **Geometric corroboration score (0–5)** — five structure-based indicators that are robust to shadow/brightness changes:
+   - `reproj_error > 0.05` — ORB keypoint homography residual (features spatially displaced)
+   - `grid_warp_mean > 0.5` — template-matching grid displacement (image blocks shifted)
+   - `flow_mean > 0.3` — whole-image optical flow elevated (not just edit region)
+   - `ssim < 0.98` — structural similarity degraded beyond brightness change
+   - `edge_diff_ratio > 0.01` — Canny edges distorted, not just dimmed
+
+**Classification rules:**
+
+| Level | Flow condition | Geometric requirement |
+|-------|---------------|----------------------|
+| NEGLIGIBLE | er_mean < 0.1 | None |
+| MILD | 0.1 ≤ er_mean < 0.5 | None |
+| MODERATE | 0.5 ≤ er_mean < 1.5 | geo ≥ 1 (else → MILD) |
+| SIGNIFICANT | er_mean ≥ 1.5 | geo ≥ 2 (geo=1 → MODERATE, geo=0 → MILD) |
+
+This two-factor approach eliminated ~83% of false positives from the original single-factor (flow-only) classifier, which incorrectly flagged shadow edits as SIGNIFICANT.
+
+### Results — v3 dataset (9,385 pairs, aadan excluded → 7,228)
+
+**Classification distribution (aadan excluded):**
+
+| Level | Count | % |
+|-------|------:|----:|
+| ✅ NEGLIGIBLE | 855 | 11.8% |
+| ⚠️ MILD | 5,530 | 76.5% |
+| 🔶 MODERATE | 756 | 10.5% |
+| 🔴 SIGNIFICANT | 87 | 1.2% |
+
+**Source distribution by warp level:**
+
+| Level | pegu_double_chin | prd-update | Total |
+|-------|----------------:|-----------:|------:|
+| NEGLIGIBLE | 416 (48.7%) | 439 (51.3%) | 855 |
+| MILD | 2,849 (51.5%) | 2,681 (48.5%) | 5,530 |
+| MODERATE | 123 (16.3%) | **633 (83.7%)** | 756 |
+| SIGNIFICANT | 12 (13.8%) | **75 (86.2%)** | 87 |
+| TOTAL | 3,400 (47.0%) | 3,828 (53.0%) | 7,228 |
+
+**Key finding:** The overall pegu/prd-update split is ~47/53, but **prd-update dominates the warped images** — 84% of MODERATE and 86% of SIGNIFICANT distortions come from prd-update. Pegu images are overwhelmingly clean (96% are NEGLIGIBLE or MILD).
+
+**Top 5 most warped images (all geo=5/5):**
+
+| Rank | base_name | er_mean | er_p95 | >1px |
+|------|-----------|--------:|-------:|-----:|
+| 1 | 85eef525…_0 | 23.25 | 85.10 | 66.4% |
+| 2 | 9c767dcc…_1 | 18.62 | 65.92 | 73.4% |
+| 3 | 60ed0eb3…_0 | 14.60 | 79.61 | 34.4% |
+| 4 | 6cb99806…_0 | 14.55 | 52.74 | 72.3% |
+| 5 | 4b3af475…_0 | 13.29 | 64.87 | 44.7% |
+
+### Review folders
+
+Flat symlink folders created at:
+```
+double_chin_data_v3/warping_review/
+  negligible/    855 pairs  (1,710 symlinks)
+  mild/        5,530 pairs (11,060 symlinks)
+  moderate/      756 pairs  (1,512 symlinks)
+  significant/    87 pairs    (174 symlinks)
+```
+Each pair has `{base_name}_original.ext` and `{base_name}_edited.ext` side by side. Relative symlinks to `../../original/` and `../../edited/`. Aadan source excluded (2,157 pairs).
+
+### Recommendations
+
+1. **Exclude SIGNIFICANT pairs from training** — 87 images (1.2%) with confirmed geometric distortion will teach the model wrong spatial transforms.
+2. **Consider excluding MODERATE pairs** — 756 (10.5%) have mild geometric artifacts; could add noise to training.
+3. **prd-update source needs extra scrutiny** — it contributes 86% of significant warping. If further filtering is needed, prioritise auditing prd-update edits.
+4. **Aadan source already excluded** — all 2,157 aadan pairs were removed from review folders.
