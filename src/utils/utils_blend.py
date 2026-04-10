@@ -37,6 +37,9 @@ class CSVMetricsLogger:
         "val_psnr",
         "val_ssim",
         "lr",
+        "grad_norm_mean",
+        "grad_norm_max",
+        "grad_clip_ratio",
         "epoch_time_s",
     ]
 
@@ -79,6 +82,9 @@ class CSVMetricsLogger:
             val_results.get("psnr", 0.0),
             val_results.get("ssim", 0.0),
             lr,
+            round(train_losses.get("grad_norm_mean", 0.0), 4),
+            round(train_losses.get("grad_norm_max", 0.0), 4),
+            round(train_losses.get("grad_clip_ratio", 0.0), 4),
             round(epoch_time, 1),
         ]
         self._writer.writerow(row)
