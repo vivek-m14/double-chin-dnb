@@ -1,2 +1,2 @@
 # Models module
-from src.models.unet import BaseUNetHalf, UNet
+from src.models.unet import BaseUNetHalf, BaseUNetHalfLite, UNet
