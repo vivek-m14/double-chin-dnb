@@ -31,7 +31,7 @@ num_workers: 8
 lambda_blend: 1.0
 lambda_blend_masked: 1.0
 lambda_blend_unmasked: 0.0
-lambda_image_mse: 0.0
+lambda_image_mse: 0..0
 lambda_perc: 0.1
 lambda_tv: 0.1
 blend_mask_threshold: 0.02

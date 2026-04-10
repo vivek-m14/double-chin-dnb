@@ -7,9 +7,9 @@ data_json: "/workspace/double_chin_data_v3/data_v3_data_final.json"
 
 # Data curation
 exclude_sources: ['aadan_double_chin']
-ssim_csv: ''                             # set to ssim_metrics.csv path to enable
+ssim_csv: '/workspace/double_chin_data_v3/ssim_metrics.csv'                             # set to ssim_metrics.csv path to enable
 ssim_exclude_tiers: ['significant']
-identity_map: ''                         # set to identity_map.json path to enable
+identity_map: '/workspace/double_chin_data_v3/identity_map.json'                         # set to identity_map.json path to enable
 train_ratio: 0.9
 
 # Reproducibility
@@ -22,7 +22,7 @@ blend_scale: 0.3                    # output range [0.2, 0.8] — covers 99.93% 
 
 # Training parameters
 num_epochs: 150
-batch_size: 8
+batch_size: 24
 learning_rate: 0.0001
 img_size: 1024
 num_workers: 8
@@ -31,7 +31,7 @@ num_workers: 8
 lambda_blend: 1.0
 lambda_blend_masked: 1.0
 lambda_blend_unmasked: 0.0
-lambda_image_mse: 1.0
+lambda_image_mse: 0.0
 lambda_perc: 0.1
 lambda_tv: 0.1
 blend_mask_threshold: 0.02
@@ -58,4 +58,4 @@ test: false
 use_mlflow: true
 mlflow_tracking_uri: 'https://mlflow.aftershoot.dev/'
 project_name: 'vk-dbc-blendmap-exp'
-run_name: 'exp2-lite-residualTanh-cosine'
+run_name: 'exp2-lite-residualTanh-cosine-faceleak-fix'
