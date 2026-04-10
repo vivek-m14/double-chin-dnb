@@ -3,6 +3,7 @@
 # Dataset configuration
 data_root: "double_chin_dataset-10k"
 data_json: "full_dataset.json"
+identity_map: ""  # Path to identity_map.json (from tools/build_identity_map.py). Leave empty for legacy random split.
 
 # Training parameters
 num_epochs: 200
@@ -12,10 +13,13 @@ img_size: 1024
 num_workers: 8
 
 # Loss weights
-lambda_blend_mse: 1.0
+lambda_blend: 1.0
+lambda_blend_masked: 1.0
+lambda_blend_unmasked: 0.0
 lambda_image_mse: 1.0
 lambda_perc: 0.1
 lambda_tv: 0.1
+blend_mask_threshold: 0.02
 
 # Learning rate scheduler
 lr_step_size: 50

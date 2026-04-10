@@ -4,6 +4,19 @@
 data_root: "/workspace"
 data_json: "/workspace/double_chin_data_v3/data_v3_data_final.json"
 
+# Data curation filters (applied in order in create_data_loaders)
+exclude_sources: ['aadan_double_chin']    # source values to drop from JSON manifest
+
+# SSIM-based data filtering (from tools/analyze_ssim.py output)
+# Set ssim_csv to the path of ssim_metrics.csv; ssim_exclude_tiers lists the
+# tiers to drop.  Leave ssim_csv empty to disable.
+ssim_csv: ''                             # e.g. '/workspace/ssim_analysis_v4/ssim_metrics.csv'
+ssim_exclude_tiers: ['significant']       # negligible | mild | moderate | significant
+
+# Identity-aware train/val split
+identity_map: ''                       # path to identity_map.json (empty = legacy random split)
+train_ratio: 0.9                       # fraction of data for training
+
 # Reproducibility
 seed: 42
 
@@ -20,10 +33,13 @@ img_size: 1024
 num_workers: 8
 
 # Loss weights
-lambda_blend_mse: 1.0
+lambda_blend: 1.0
+lambda_blend_masked: 1.0
+lambda_blend_unmasked: 0.0
 lambda_image_mse: 1.0
 lambda_perc: 0.1
 lambda_tv: 0.1
+blend_mask_threshold: 0.02
 
 # Learning rate scheduler
 lr_scheduler: 'cosine'   # 'cosine' (CosineAnnealingLR) or 'step' (StepLR)
@@ -37,6 +53,7 @@ pretrained_path: ''      # Path to pretrained model (empty for training from scr
 resume_path: ''          # Path to full checkpoint to resume training (includes optimizer/scheduler/epoch)
 save_interval: 5         # Save checkpoint every N epochs
 start_epoch: 0           # Starting epoch (useful for resuming training)
+early_stopping_patience: 30  # Stop if no metric improves for N epochs (0 = disabled)
 
 # Distributed training
 port: 12350

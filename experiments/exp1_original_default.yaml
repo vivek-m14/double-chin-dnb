@@ -5,6 +5,13 @@
 data_root: "/workspace"
 data_json: "/workspace/double_chin_data_v3/data_v3_data_final.json"
 
+# Data curation
+exclude_sources: ['aadan_double_chin']
+ssim_csv: ''                             # set to ssim_metrics.csv path to enable
+ssim_exclude_tiers: ['significant']
+identity_map: ''                         # set to identity_map.json path to enable
+train_ratio: 0.9
+
 # Reproducibility
 seed: 42
 
@@ -21,10 +28,13 @@ img_size: 1024
 num_workers: 8
 
 # Loss weights
-lambda_blend_mse: 1.0
+lambda_blend: 1.0
+lambda_blend_masked: 1.0
+lambda_blend_unmasked: 0.0
 lambda_image_mse: 1.0
 lambda_perc: 0.1
 lambda_tv: 0.1
+blend_mask_threshold: 0.02
 
 # Learning rate scheduler
 lr_scheduler: 'step'     # original used StepLR
@@ -38,6 +48,7 @@ pretrained_path: ''
 resume_path: ''
 save_interval: 5
 start_epoch: 0
+early_stopping_patience: 30
 
 # Distributed training
 port: 12350

@@ -2,6 +2,13 @@
 data_root: "smoke_test_data"
 data_json: "smoke_test_data/manifest.json"
 
+# Data curation — disabled for synthetic smoke-test data
+exclude_sources: []          # no source exclusion on synthetic data
+ssim_csv: ''
+ssim_exclude_tiers: []
+identity_map: ''
+train_ratio: 0.9
+
 model_variant: 'default'   # 'default' or 'lite'
 
 num_epochs: 2
@@ -14,10 +21,13 @@ img_size: 512
 num_workers: 0
 pin_memory: false
 
-lambda_blend_mse: 1.0
+lambda_blend: 1.0
+lambda_blend_masked: 1.0
+lambda_blend_unmasked: 0.0
 lambda_image_mse: 1.0
 lambda_perc: 0.1
 lambda_tv: 0.1
+blend_mask_threshold: 0.02
 
 lr_step_size: 50
 lr_gamma: 0.1
