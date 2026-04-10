@@ -22,15 +22,20 @@ class CSVMetricsLogger:
         "epoch",
         "train_total_loss",
         "train_blend_map_loss",
+        "train_blend_masked_loss",
+        "train_blend_unmasked_loss",
         "train_image_mse_loss",
         "train_perc_loss",
         "train_tv_loss",
         "val_total_loss",
         "val_blend_map_loss",
+        "val_blend_masked_loss",
+        "val_blend_unmasked_loss",
         "val_image_mse_loss",
         "val_perc_loss",
         "val_tv_loss",
         "val_psnr",
+        "val_ssim",
         "lr",
         "epoch_time_s",
     ]
@@ -59,15 +64,20 @@ class CSVMetricsLogger:
             epoch,
             train_losses.get("total_loss", 0.0),
             train_losses.get("blend_map_loss", 0.0),
+            train_losses.get("blend_masked_loss", 0.0),
+            train_losses.get("blend_unmasked_loss", 0.0),
             train_losses.get("image_mse_loss", 0.0),
             train_losses.get("perc_loss", 0.0),
             train_losses.get("tv_loss", 0.0),
             val_results.get("total_loss", 0.0),
             val_results.get("blend_map_loss", 0.0),
+            val_results.get("blend_masked_loss", 0.0),
+            val_results.get("blend_unmasked_loss", 0.0),
             val_results.get("image_mse_loss", 0.0),
             val_results.get("perc_loss", 0.0),
             val_results.get("tv_loss", 0.0),
             val_results.get("psnr", 0.0),
+            val_results.get("ssim", 0.0),
             lr,
             round(epoch_time, 1),
         ]
@@ -101,7 +111,7 @@ def get_git_sha():
         return 'unknown'
 
 
-def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss, is_ddp=False, git_sha=None, model_config=None):
+def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss, is_ddp=False, git_sha=None, model_config=None, best_psnr=None, best_ssim=None):
     """
     Save a full training checkpoint for resumable training.
 
@@ -115,6 +125,8 @@ def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss
         is_ddp: Whether the model is wrapped in DDP (will save module.state_dict)
         git_sha: Git commit hash (auto-detected if None)
         model_config: Dict with model architecture info (model_variant, last_layer_activation, blend_scale)
+        best_psnr: Best validation PSNR so far (optional)
+        best_ssim: Best validation SSIM so far (optional)
     """
     state_dict = model.module.state_dict() if is_ddp else model.state_dict()
     tmp_path = path + '.tmp'
@@ -128,6 +140,10 @@ def save_full_checkpoint(path, model, optimizer, scheduler, epoch, best_val_loss
     }
     if model_config is not None:
         payload['model_config'] = model_config
+    if best_psnr is not None:
+        payload['best_psnr'] = best_psnr
+    if best_ssim is not None:
+        payload['best_ssim'] = best_ssim
     torch.save(payload, tmp_path)
     os.replace(tmp_path, path)  # atomic on Linux/macOS — crash-safe
 
@@ -166,14 +182,18 @@ def load_full_checkpoint(path, model, optimizer=None, scheduler=None, device='cp
 
     start_epoch = ckpt.get('epoch', -1) + 1  # next epoch to run
     best_val_loss = ckpt.get('best_val_loss', float('inf'))
+    best_psnr = ckpt.get('best_psnr', 0.0)
+    best_ssim = ckpt.get('best_ssim', 0.0)
 
-    print(f"Resumed from {path} (epoch {ckpt.get('epoch', '?')}, best_val_loss={best_val_loss:.4f})")
+    print(f"Resumed from {path} (epoch {ckpt.get('epoch', '?')}, best_val_loss={best_val_loss:.4f}, best_psnr={best_psnr:.2f}, best_ssim={best_ssim:.4f})")
     return {
         'model': model,
         'optimizer': optimizer,
         'scheduler': scheduler,
         'start_epoch': start_epoch,
         'best_val_loss': best_val_loss,
+        'best_psnr': best_psnr,
+        'best_ssim': best_ssim,
     }
 
 
@@ -378,14 +398,17 @@ def compute_metrics(pred_images, gt_images):
         gt_images: Ground truth images tensor [B, C, H, W]
         
     Returns:
-        dict: Dictionary of metrics (PSNR, SSIM, etc.)
+        dict: Dictionary of metrics (PSNR, SSIM)
     """
+    from skimage.metrics import structural_similarity as ssim_fn
+
     # Make sure tensors are on CPU and detached from the computation graph
     pred_np = pred_images.detach().cpu().numpy()
     gt_np = gt_images.detach().cpu().numpy()
     
     batch_size = pred_np.shape[0]
     psnr_values = []
+    ssim_values = []
     
     for i in range(batch_size):
         pred = pred_np[i].transpose(1, 2, 0)  # [C, H, W] -> [H, W, C]
@@ -399,13 +422,17 @@ def compute_metrics(pred_images, gt_images):
             psnr = float('inf')
         else:
             psnr = 10 * np.log10(1.0 / mse)
-        
         psnr_values.append(psnr)
+        
+        # Calculate SSIM (multichannel, data_range=1.0 for [0,1] images)
+        ssim_val = ssim_fn(gt, pred, data_range=1.0, channel_axis=2)
+        ssim_values.append(ssim_val)
     
     # Calculate average metrics
     avg_psnr = np.mean(psnr_values)
+    avg_ssim = np.mean(ssim_values)
     
     return {
         'psnr': avg_psnr,
-        # Add more metrics as needed
+        'ssim': avg_ssim,
     }
