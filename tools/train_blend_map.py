@@ -1,6 +1,7 @@
 """
 Distributed training script for the skin retouching model.
 """
+import logging
 import os
 import yaml
 import torch
@@ -27,6 +28,38 @@ from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
 from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint, get_git_sha, CSVMetricsLogger, save_training_data_montage
 
+logger = logging.getLogger("train")
+
+
+def setup_logging(save_dir: str, rank: int) -> None:
+    """Configure logging to write to both console and a file.
+
+    Only rank 0 gets file logging.  All ranks get a console handler at
+    INFO level so ``logger.info()`` replaces ``print()`` seamlessly.
+    """
+    root = logging.getLogger("train")
+    root.setLevel(logging.DEBUG)
+    root.handlers.clear()
+
+    fmt = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # Console handler (all ranks)
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.INFO)
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    # File handler (rank 0 only)
+    if rank == 0:
+        os.makedirs(save_dir, exist_ok=True)
+        fh = logging.FileHandler(os.path.join(save_dir, "train.log"), mode="a")
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+
 
 def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, world_size, epoch, num_epochs):
     """
@@ -50,6 +83,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
     running_losses = {'total_loss': 0.0, 'blend_map_loss': 0.0,
                     'blend_masked_loss': 0.0, 'blend_unmasked_loss': 0.0,
                     'image_mse_loss': 0.0, 'perc_loss': 0.0, 'tv_loss': 0.0}
+    grad_norms = []  # track per-step gradient norms
     
     if local_rank == 0:
         train_bar = tqdm(enumerate(train_loader), total=len(train_loader), 
@@ -76,7 +110,8 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
 
         # Backward and optimize
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norms.append(grad_norm.item())
         optimizer.step()
 
         # Update running losses
@@ -92,6 +127,13 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
         dist.reduce(loss_tensor, dst=0)
         if local_rank == 0:
             running_losses[key] = loss_tensor.item() / (len(train_loader) * world_size)
+
+    # Grad norm stats (local to this rank, not reduced — each rank sees its own grads)
+    if grad_norms:
+        gn = torch.tensor(grad_norms)
+        running_losses['grad_norm_mean'] = gn.mean().item()
+        running_losses['grad_norm_max'] = gn.max().item()
+        running_losses['grad_clip_ratio'] = (gn > 1.0).float().mean().item()
 
     return running_losses
 
@@ -197,7 +239,18 @@ def train_skin_retouching_model(local_rank, world_size, args):
         world_size: Total number of processes
         args: Dictionary of arguments
     """
-    print(f"Process {local_rank}: Starting initialization")
+    # Set up logging (file handler only for rank 0; must happen after save_dir exists)
+    save_dir = args.get('save_dir', 'weights')
+    setup_logging(save_dir, local_rank)
+
+    logger.info(f"Process {local_rank}: Starting initialization")
+
+    # Log full config (rank 0 only, goes to train.log for post-mortem debugging)
+    if local_rank == 0:
+        logger.info("─── Config ───")
+        for k, v in args.items():
+            logger.info(f"  {k}: {v}")
+        logger.info("───────────────")
     
     # Reproducibility
     seed = args.get('seed', 42)
@@ -214,7 +267,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
     # Set up distributed training
     device = torch.device(f'cuda:{local_rank}')
     torch.cuda.set_device(local_rank)
-    print(f"Process {local_rank}: Set device to {device}")
+    logger.info(f"Process {local_rank}: Set device to {device}")
     
     # Initialize MLflow for the main process (non-fatal — training continues without it)
     mlflow_active = False
@@ -229,12 +282,12 @@ def train_skin_retouching_model(local_rank, world_size, args):
             })
             mlflow.set_tag('git_sha', args.get('git_sha', 'unknown'))
             mlflow_active = True
-            print("MLflow initialized successfully")
+            logger.info("MLflow initialized successfully")
         except Exception as e:
-            print(f"WARNING: MLflow init failed ({e}). Training will continue without MLflow.", flush=True)
+            logger.warning(f"MLflow init failed ({e}). Training will continue without MLflow.")
             mlflow_active = False
     
-    print(f"Process {local_rank}: Creating data loaders")
+    logger.info(f"Process {local_rank}: Creating data loaders")
     # On resume, load the saved data fingerprint for drift detection
     resume_path = args.get('resume_path', '')
     if resume_path and os.path.isfile(resume_path):
@@ -247,14 +300,14 @@ def train_skin_retouching_model(local_rank, world_size, args):
             if 'data_fingerprint' in saved_cfg:
                 args['data_fingerprint'] = saved_cfg['data_fingerprint']
                 if local_rank == 0:
-                    print(f"  Loaded saved data fingerprint for drift check")
+                    logger.info("  Loaded saved data fingerprint for drift check")
     # Create data loaders
     train_loader, test_loader, train_sampler, _ = create_data_loaders(
         args, world_size=world_size, rank=local_rank, test=args.get('test', False)
     )
-    print(f"Process {local_rank}: Data loaders created")
+    logger.info(f"Process {local_rank}: Data loaders created")
     
-    print(f"Process {local_rank}: Creating model")
+    logger.info(f"Process {local_rank}: Creating model")
     # Create model
     ModelClass = BaseUNetHalfLite if args.get('model_variant', 'default') == 'lite' else BaseUNetHalf
     model = ModelClass(
@@ -268,18 +321,18 @@ def train_skin_retouching_model(local_rank, world_size, args):
         'last_layer_activation': args.get('last_layer_activation', 'sigmoid'),
         'blend_scale': args.get('blend_scale', 0.5),
     }
-    print(f"Process {local_rank}: Model created and moved to device")
+    logger.info(f"Process {local_rank}: Model created and moved to device")
 
     # get number of parameters and size in MB
     num_params = sum(p.numel() for p in model.parameters())
     if local_rank == 0:
-        print(f"Process {local_rank}: Number of parameters: {num_params}")
-        print(f"Process {local_rank}: Model size: {num_params * 4 / 1024 / 1024:.2f} MB")
+        logger.info(f"Number of parameters: {num_params:,}")
+        logger.info(f"Model size: {num_params * 4 / 1024 / 1024:.2f} MB")
     
     # Load pretrained model if available
     if args.get('pretrained_path'):
         if local_rank == 0:
-            print(f"Loading pretrained model from {args['pretrained_path']}")
+            logger.info(f"Loading pretrained model from {args['pretrained_path']}")
         model = load_checkpoint(model, args['pretrained_path'])
     
     # Ensure VGG16 weights are cached before all ranks try to load them
@@ -337,7 +390,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
         best_psnr_epoch = start_epoch
         best_ssim_epoch = start_epoch
         if local_rank == 0:
-            print(f"Resuming from epoch {start_epoch}, best_val_loss={best_test_loss:.4f}, best_psnr={best_psnr:.2f}, best_ssim={best_ssim:.4f}")
+            logger.info(f"Resuming from epoch {start_epoch}, best_val_loss={best_test_loss:.4f}, best_psnr={best_psnr:.2f}, best_ssim={best_ssim:.4f}")
 
     # Flush any pending CUDA errors and sync all ranks before DDP
     try:
@@ -349,18 +402,18 @@ def train_skin_retouching_model(local_rank, world_size, args):
         sys.stderr.flush()
         raise
 
-    print(f"Process {local_rank}: Pre-DDP barrier", flush=True)
+    logger.info(f"Process {local_rank}: Pre-DDP barrier")
     dist.barrier()  # ensure all ranks are alive before DDP
-    print(f"Process {local_rank}: Wrapping model with DDP", flush=True)
+    logger.info(f"Process {local_rank}: Wrapping model with DDP")
     try:
         # Wrap model with DDP
         model = DDP(model, device_ids=[local_rank])
-        print(f"Process {local_rank}: Model wrapped with DDP", flush=True)
+        logger.info(f"Process {local_rank}: Model wrapped with DDP")
         
         # Ensure all processes are synchronized
-        print(f"Process {local_rank}: Waiting at post-DDP barrier", flush=True)
+        logger.info(f"Process {local_rank}: Waiting at post-DDP barrier")
         dist.barrier()
-        print(f"Process {local_rank}: Passed barrier", flush=True)
+        logger.info(f"Process {local_rank}: Passed barrier")
     except Exception as e:
         print(f"Process {local_rank}: Failed to initialize DDP: {e}", flush=True)
         traceback.print_exc()
@@ -409,7 +462,14 @@ def train_skin_retouching_model(local_rank, world_size, args):
         
         # Log training results
         if local_rank == 0:
-            print(f"\nEpoch [{epoch + 1}/{num_epochs}], Training Loss: {train_losses['total_loss']:.4f}")
+            gn_mean = train_losses.get('grad_norm_mean', 0)
+            gn_max = train_losses.get('grad_norm_max', 0)
+            clip_pct = train_losses.get('grad_clip_ratio', 0) * 100
+            logger.info(
+                f"Epoch [{epoch + 1}/{num_epochs}], "
+                f"Training Loss: {train_losses['total_loss']:.4f}, "
+                f"Grad Norm: mean={gn_mean:.3f} max={gn_max:.3f} clipped={clip_pct:.0f}%"
+            )
             if mlflow_active:
                 try:
                     mlflow.log_metrics({
@@ -421,6 +481,9 @@ def train_skin_retouching_model(local_rank, world_size, args):
                         'train_perc_loss': train_losses['perc_loss'],
                         'train_tv_loss': train_losses['tv_loss'],
                         'lr': optimizer.param_groups[0]['lr'],
+                        'grad_norm_mean': train_losses.get('grad_norm_mean', 0),
+                        'grad_norm_max': train_losses.get('grad_norm_max', 0),
+                        'grad_clip_ratio': train_losses.get('grad_clip_ratio', 0),
                     }, step=epoch + 1)
                 except Exception:
                     pass
@@ -433,10 +496,10 @@ def train_skin_retouching_model(local_rank, world_size, args):
         
         # Log validation results
         if local_rank == 0:
-            print(f"\nTesting Statistics:")
-            print(f"Average Testing Loss: {test_results['total_loss']:.4f}")
-            print(f"Average PSNR: {test_results['psnr']:.2f} dB")
-            print(f"Average SSIM: {test_results['ssim']:.4f}")
+            logger.info(f"Testing Statistics:")
+            logger.info(f"  Average Testing Loss: {test_results['total_loss']:.4f}")
+            logger.info(f"  Average PSNR: {test_results['psnr']:.2f} dB")
+            logger.info(f"  Average SSIM: {test_results['ssim']:.4f}")
             
             if mlflow_active:
                 try:
@@ -472,7 +535,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
                     model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
                     model_config=model_config, best_psnr=best_psnr, best_ssim=best_ssim,
                 )
-                print(f"New best model saved! (Epoch {best_epoch}, Loss: {best_test_loss:.4f})")
+                logger.info(f"New best model saved! (Epoch {best_epoch}, Loss: {best_test_loss:.4f})")
             
             # Save best PSNR model
             if test_results['psnr'] > best_psnr:
@@ -483,7 +546,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
                     model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
                     model_config=model_config, best_psnr=best_psnr, best_ssim=best_ssim,
                 )
-                print(f"New best PSNR model saved! (Epoch {best_psnr_epoch}, PSNR: {best_psnr:.2f} dB)")
+                logger.info(f"New best PSNR model saved! (Epoch {best_psnr_epoch}, PSNR: {best_psnr:.2f} dB)")
             
             # Save best SSIM model
             if test_results['ssim'] > best_ssim:
@@ -494,7 +557,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
                     model, optimizer, scheduler, epoch, best_test_loss, is_ddp=True,
                     model_config=model_config, best_psnr=best_psnr, best_ssim=best_ssim,
                 )
-                print(f"New best SSIM model saved! (Epoch {best_ssim_epoch}, SSIM: {best_ssim:.4f})")
+                logger.info(f"New best SSIM model saved! (Epoch {best_ssim_epoch}, SSIM: {best_ssim:.4f})")
             
             # Early stopping: no improvement in ANY metric for `patience` epochs
             epochs_since_improvement = min(
@@ -504,10 +567,10 @@ def train_skin_retouching_model(local_rank, world_size, args):
             )
             patience = args.get('early_stopping_patience', 30)  # 0 = disabled
             if patience > 0 and epochs_since_improvement >= patience:
-                print(f"\nEarly stopping triggered! No improvement for {patience} epochs.")
-                print(f"  Best loss: {best_test_loss:.4f} (epoch {best_epoch})")
-                print(f"  Best PSNR: {best_psnr:.2f} dB (epoch {best_psnr_epoch})")
-                print(f"  Best SSIM: {best_ssim:.4f} (epoch {best_ssim_epoch})")
+                logger.info(f"Early stopping triggered! No improvement for {patience} epochs.")
+                logger.info(f"  Best loss: {best_test_loss:.4f} (epoch {best_epoch})")
+                logger.info(f"  Best PSNR: {best_psnr:.2f} dB (epoch {best_psnr_epoch})")
+                logger.info(f"  Best SSIM: {best_ssim:.4f} (epoch {best_ssim_epoch})")
             
             # Rolling latest checkpoint (overwritten every epoch for crash recovery)
             save_full_checkpoint(
@@ -537,25 +600,28 @@ def train_skin_retouching_model(local_rank, world_size, args):
 
         epoch_end_time = time.time()
         if local_rank == 0:
-            print(f"Epoch {epoch + 1} took {datetime.timedelta(seconds=epoch_end_time - epoch_start_time)}")
+            logger.info(f"Epoch {epoch + 1} took {datetime.timedelta(seconds=epoch_end_time - epoch_start_time)}")
             ETA = (num_epochs - epoch - 1) * (epoch_end_time - epoch_start_time)
-            print(f"ETA: {datetime.timedelta(seconds=ETA)}")
+            logger.info(f"ETA: {datetime.timedelta(seconds=ETA)}")
     
     # Cleanup and final logging
     if local_rank == 0:
         if csv_logger:
             csv_logger.close()
-        print("Finished Training")
-        print(f"Best model (loss) was from epoch {best_epoch} with test loss: {best_test_loss:.4f}")
-        print(f"Best model (PSNR) was from epoch {best_psnr_epoch} with PSNR: {best_psnr:.2f} dB")
-        print(f"Best model (SSIM) was from epoch {best_ssim_epoch} with SSIM: {best_ssim:.4f}")
+        logger.info("Finished Training")
+        logger.info(f"Best model (loss) was from epoch {best_epoch} with test loss: {best_test_loss:.4f}")
+        logger.info(f"Best model (PSNR) was from epoch {best_psnr_epoch} with PSNR: {best_psnr:.2f} dB")
+        logger.info(f"Best model (SSIM) was from epoch {best_ssim_epoch} with SSIM: {best_ssim:.4f}")
         
         if mlflow_active:
             try:
+                log_path = os.path.join(save_dir, "train.log")
+                if os.path.isfile(log_path):
+                    mlflow.log_artifact(log_path)
                 mlflow.log_artifact(f'{save_dir}/checkpoint_best.pth')
                 mlflow.end_run()
             except Exception as e:
-                print(f"WARNING: MLflow finalization failed: {e}")
+                logger.warning(f"MLflow finalization failed: {e}")
 
 
 def main_worker(local_rank, world_size, args):
@@ -654,16 +720,18 @@ def main():
     config['init_method'] = f'tcp://127.0.0.1:{config["port"]}'
     config['git_sha'] = get_git_sha()
     
-    print(f"Starting distributed training with {world_size} GPUs")
-    print(f"Git SHA: {config['git_sha']}")
-    print(f"Training parameters: {config['num_epochs']} epochs, batch size {config['batch_size']}, lr {config['learning_rate']}")
-    print(f"Save directory: {config['save_dir']}")
+    # Set up logging for the launcher process (before workers spawn)
+    setup_logging(config['save_dir'], rank=0)
+    logger.info(f"Starting distributed training with {world_size} GPUs")
+    logger.info(f"Git SHA: {config['git_sha']}")
+    logger.info(f"Training parameters: {config['num_epochs']} epochs, batch size {config['batch_size']}, lr {config['learning_rate']}")
+    logger.info(f"Save directory: {config['save_dir']}")
     
     try:
         mp.set_start_method('spawn', force=True)
         mp.spawn(main_worker, nprocs=world_size, args=(world_size, config))
     except Exception as e:
-        print(f"Training failed: {e}")
+        logger.error(f"Training failed: {e}")
     finally:
         cleanup()
 

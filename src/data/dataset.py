@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import logging
 import os
 import cv2
 import numpy as np
@@ -13,6 +14,8 @@ import yaml
 from src.blend.blend_map import process_target_blend_map, compute_target_blend_map
 
 import json
+
+logger = logging.getLogger("train")
 
 
 class BlendMapDataset(Dataset):
@@ -71,7 +74,7 @@ class BlendMapDataset(Dataset):
         if test:
             data_map = data_map[:100]
 
-        print(f"Length of data_map: {len(data_map)}")
+        logger.info(f"Length of data_map: {len(data_map)}")
         self.data_map = data_map
 
         # Build Albumentations pipeline (applied identically to image & gt)
@@ -162,7 +165,7 @@ class BlendMapDataset(Dataset):
                 raise e
             with open('error_log1.txt', 'a') as f:
                 f.write(f"Error in reading {img_path}, {gt_path}: {e}\n")
-            print(f"Error in reading {img_path}, {gt_path}: {e}")
+            logger.warning(f"Error in reading {img_path}, {gt_path}: {e} (retry {retry+1})")
             return self.__getitem__(np.random.randint(0, len(self)), retry=retry+1)
 
 
@@ -357,8 +360,8 @@ def validate_data_fingerprint(args: dict) -> None:
             continue
         current_hash = _file_sha256(path)
         if current_hash != old_hash:
-            print(
-                f"  ⚠ DATA DRIFT: {path_key} hash changed! "
+            logger.warning(
+                f"DATA DRIFT: {path_key} hash changed! "
                 f"saved={old_hash}  current={current_hash}  "
                 f"(file: {path})"
             )
@@ -414,7 +417,7 @@ def _identity_aware_split(
             unmapped += 1
 
     if unmapped:
-        print(f"  ⚠ {unmapped}/{len(data_map)} samples not in identity map (each assigned own identity)")
+        logger.warning(f"{unmapped}/{len(data_map)} samples not in identity map (each assigned own identity)")
 
     # Group indices by identity
     identity_to_indices: dict = {}
@@ -446,9 +449,9 @@ def _identity_aware_split(
                 val_indices.extend(group)
 
     actual_ratio = len(train_indices) / n_samples if n_samples else 0
-    print(f"  Identity-aware split: {n_identities} identities → "
-          f"{len(train_indices)} train ({actual_ratio:.1%}), "
-          f"{len(val_indices)} val ({1-actual_ratio:.1%})")
+    logger.info(f"Identity-aware split: {n_identities} identities → "
+                f"{len(train_indices)} train ({actual_ratio:.1%}), "
+                f"{len(val_indices)} val ({1-actual_ratio:.1%})")
 
     return train_indices, val_indices
 
@@ -492,8 +495,8 @@ def _filter_data_map(
         src_set = set(exclude_sources)
         before = len(data_map)
         data_map = [e for e in data_map if e.get("source") not in src_set]
-        print(f"Source filter: excluded {before - len(data_map)}/{before} "
-              f"pairs (sources={sorted(src_set)})")
+        logger.info(f"Source filter: excluded {before - len(data_map)}/{before} "
+                    f"pairs (sources={sorted(src_set)})")
 
     # ── 2. SSIM tier filter ───────────────────────────────────────────
     if ssim_csv and ssim_exclude_tiers:
@@ -510,8 +513,8 @@ def _filter_data_map(
             if os.path.splitext(os.path.basename(e[image_key]))[0]
                not in excluded_stems
         ]
-        print(f"SSIM filter: excluded {before - len(data_map)}/{before} "
-              f"pairs (tiers={sorted(tier_set)})")
+        logger.info(f"SSIM filter: excluded {before - len(data_map)}/{before} "
+                    f"pairs (tiers={sorted(tier_set)})")
 
     return data_map
 
@@ -542,7 +545,7 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
     # ------------------------------------------------------------------
     with open(args['data_json']) as f:
         raw_data_map = json.load(f)
-    print(f"JSON manifest loaded: {len(raw_data_map)} entries")
+    logger.info(f"JSON manifest loaded: {len(raw_data_map)} entries")
 
     data_map = _filter_data_map(
         raw_data_map,
@@ -551,7 +554,7 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
         ssim_exclude_tiers=args.get('ssim_exclude_tiers', None),
         image_key=BlendMapDataset.ORIGINAL_IMAGE,
     )
-    print(f"After filtering: {len(data_map)} entries")
+    logger.info(f"After filtering: {len(data_map)} entries")
 
     # ------------------------------------------------------------------
     # 2. Create dataset(s) with the curated data_map
@@ -588,7 +591,7 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
 
     if identity_map_path and os.path.isfile(identity_map_path):
         # ── Identity-aware split (leak-free) ──────────────────────────
-        print(f"Using identity-aware split from: {identity_map_path}")
+        logger.info(f"Using identity-aware split from: {identity_map_path}")
         id_map = _load_identity_map(identity_map_path)
 
         # Validate the identity map isn't stale / partial
@@ -600,8 +603,8 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
             )
         map_total = meta.get("total_images", 0)
         if map_total > 0 and abs(map_total - n) > 0.05 * n:
-            print(
-                f"  ⚠ identity_map covers {map_total} images but dataset has {n}. "
+            logger.warning(
+                f"identity_map covers {map_total} images but dataset has {n}. "
                 f"Consider rebuilding the identity map."
             )
 
@@ -616,9 +619,9 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
     else:
         # ── Legacy random split (kept for backward compat) ────────────
         if identity_map_path:
-            print(f"⚠ identity_map path not found: {identity_map_path} — falling back to random split")
+            logger.warning(f"identity_map path not found: {identity_map_path} — falling back to random split")
         else:
-            print("⚠ No identity_map configured — using legacy random split (may have identity leakage)")
+            logger.warning("No identity_map configured — using legacy random split (may have identity leakage)")
 
         train_size = int(n * train_ratio)
         split_gen = torch.Generator().manual_seed(args.get("seed", 42))
@@ -641,7 +644,7 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
         n_train=len(train_indices),
         n_val=len(val_indices),
     )
-    print(f"Data fingerprint: {args['data_fingerprint']}")
+    logger.info(f"Data fingerprint: {args['data_fingerprint']}")
 
     # Create samplers for distributed training if world_size and rank are provided
     if world_size is not None and rank is not None:
