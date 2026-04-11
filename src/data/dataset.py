@@ -81,13 +81,13 @@ class BlendMapDataset(Dataset):
         if augment:
             self.aug = A.Compose([
                 # ── Geometric ──
+                # NOTE: Only HFlip + small rotation (±10°) to stay compatible
+                # with the bottom-50% ROI crop in BaseUNetHalfLite.  Large
+                # rotations (90°/180°/45°) would move chin pixels out of the
+                # crop region.  ±10° on a 1024-px face crop shifts chin pixels
+                # ~90 px — still well within the bottom 512 rows.
                 A.HorizontalFlip(p=0.5),
-                A.Rotate(limit=30, border_mode=cv2.BORDER_CONSTANT, value=0, p=0.5),
-                A.OneOf([
-                    A.Rotate(limit=(90, 90), p=1),
-                    A.Rotate(limit=(180, 180), p=1),
-                    A.Rotate(limit=(45, 45), p=1),
-                ], p=0.2),
+                A.Rotate(limit=10, border_mode=cv2.BORDER_CONSTANT, value=0, p=0.3),
 
                 # ── Color / tone ──
                 A.ColorJitter(
@@ -664,6 +664,7 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
         shuffle=(train_sampler is None),
         pin_memory=True,
         persistent_workers=(num_workers > 0),
+        drop_last=True,   # prevent uneven last-batch across DDP ranks
     )
     
     test_loader = DataLoader(
@@ -674,6 +675,7 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
         shuffle=False,
         pin_memory=True,
         persistent_workers=(num_workers > 0),
+        drop_last=False,  # val: keep all samples; DistributedSampler pads evenly
     )
     
     return train_loader, test_loader, train_sampler, test_sampler

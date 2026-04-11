@@ -36,6 +36,8 @@ class CSVMetricsLogger:
         "val_tv_loss",
         "val_psnr",
         "val_ssim",
+        "val_roi_psnr",
+        "val_roi_ssim",
         "lr",
         "grad_norm_mean",
         "grad_norm_max",
@@ -46,7 +48,31 @@ class CSVMetricsLogger:
     def __init__(self, save_dir: str, filename: str = "metrics.csv"):
         self.path = os.path.join(save_dir, filename)
         write_header = not os.path.exists(self.path)
-        self._fp = open(self.path, "a", newline="")
+
+        # On resume: detect column schema change and migrate gracefully
+        if not write_header:
+            try:
+                with open(self.path, "r", newline="") as f:
+                    reader = csv.reader(f)
+                    existing_header = next(reader, None)
+                if existing_header is not None and existing_header != self.COLUMNS:
+                    # Schema changed — back up old CSV and start fresh
+                    import shutil
+                    backup = self.path + ".bak"
+                    shutil.copy2(self.path, backup)
+                    write_header = True  # will create new file with updated header
+                    # Log to stderr so it's visible even without a logger
+                    import sys
+                    print(
+                        f"[CSVMetricsLogger] Column schema changed. "
+                        f"Backed up old CSV to {backup} and starting fresh.",
+                        file=sys.stderr,
+                    )
+            except Exception:
+                pass  # if we can't read the header, just append as before
+
+        mode = "w" if write_header and os.path.exists(self.path) else "a"
+        self._fp = open(self.path, mode, newline="")
         self._writer = csv.writer(self._fp)
         if write_header:
             self._writer.writerow(self.COLUMNS)
@@ -81,6 +107,8 @@ class CSVMetricsLogger:
             val_results.get("tv_loss", 0.0),
             val_results.get("psnr", 0.0),
             val_results.get("ssim", 0.0),
+            val_results.get("roi_psnr", 0.0),
+            val_results.get("roi_ssim", 0.0),
             lr,
             round(train_losses.get("grad_norm_mean", 0.0), 4),
             round(train_losses.get("grad_norm_max", 0.0), 4),
@@ -172,7 +200,7 @@ def load_full_checkpoint(path, model, optimizer=None, scheduler=None, device='cp
     if not os.path.exists(path):
         raise FileNotFoundError(f"Checkpoint not found: {path}")
 
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
 
     # Load model weights (strip DDP 'module.' prefix if present)
     state_dict = ckpt['model_state_dict']
@@ -379,15 +407,8 @@ def save_visualization_batch(batch, outputs, save_dir, prefix="", max_samples=4)
 
         # Get base filename without extension
         base_name = os.path.splitext(filenames[i])[0]
-        
-        # Save images
-        cv2.imwrite(f"{save_dir}/{prefix}_{base_name}_original.jpg", orig_img)
-        cv2.imwrite(f"{save_dir}/{prefix}_{base_name}_gt.jpg", gt_img)
-        cv2.imwrite(f"{save_dir}/{prefix}_{base_name}_gt_blend.jpg", gt_blend)
-        cv2.imwrite(f"{save_dir}/{prefix}_{base_name}_pred_blend.jpg", pred_blend)
-        cv2.imwrite(f"{save_dir}/{prefix}_{base_name}_retouched.jpg", retouched)
-        
-        # Create a grid visualization (optional)
+
+        # Grid: top row = [original, gt_blend, gt], bottom row = [original, pred_blend, retouched]
         grid = np.concatenate([
             np.concatenate([orig_img, gt_blend, gt_img], axis=1),
             np.concatenate([orig_img, pred_blend, retouched], axis=1)
@@ -395,16 +416,20 @@ def save_visualization_batch(batch, outputs, save_dir, prefix="", max_samples=4)
         cv2.imwrite(f"{save_dir}/{prefix}_{base_name}_grid.jpg", grid)
 
 
-def compute_metrics(pred_images, gt_images):
+def compute_metrics(pred_images, gt_images, roi_crop_fraction=0.0):
     """
     Compute evaluation metrics between predicted and ground truth images.
     
     Args:
         pred_images: Predicted images tensor [B, C, H, W]
         gt_images: Ground truth images tensor [B, C, H, W]
+        roi_crop_fraction: If > 0, also compute PSNR/SSIM on the bottom
+            fraction of the image (the chin/edit region).  E.g. 0.5 means
+            bottom 50%.  Set to 0 to skip ROI metrics.
         
     Returns:
-        dict: Dictionary of metrics (PSNR, SSIM)
+        dict: Dictionary of metrics (psnr, ssim, and optionally
+              roi_psnr, roi_ssim)
     """
     from skimage.metrics import structural_similarity as ssim_fn
 
@@ -415,30 +440,46 @@ def compute_metrics(pred_images, gt_images):
     batch_size = pred_np.shape[0]
     psnr_values = []
     ssim_values = []
+    roi_psnr_values = []
+    roi_ssim_values = []
+
+    compute_roi = roi_crop_fraction > 0.0
     
     for i in range(batch_size):
         pred = pred_np[i].transpose(1, 2, 0)  # [C, H, W] -> [H, W, C]
         gt = gt_np[i].transpose(1, 2, 0)
         
-        # Calculate MSE
+        # ── Full-image metrics ──
         mse = np.mean((pred - gt) ** 2)
-        
-        # Calculate PSNR
         if mse == 0:
             psnr = float('inf')
         else:
             psnr = 10 * np.log10(1.0 / mse)
         psnr_values.append(psnr)
-        
-        # Calculate SSIM (multichannel, data_range=1.0 for [0,1] images)
-        ssim_val = ssim_fn(gt, pred, data_range=1.0, channel_axis=2)
-        ssim_values.append(ssim_val)
+        ssim_values.append(ssim_fn(gt, pred, data_range=1.0, channel_axis=2))
+
+        # ── ROI (bottom crop) metrics ──
+        if compute_roi:
+            h = pred.shape[0]
+            crop_start = int(h * (1.0 - roi_crop_fraction))
+            pred_roi = pred[crop_start:, :, :]
+            gt_roi = gt[crop_start:, :, :]
+
+            roi_mse = np.mean((pred_roi - gt_roi) ** 2)
+            if roi_mse == 0:
+                roi_psnr = float('inf')
+            else:
+                roi_psnr = 10 * np.log10(1.0 / roi_mse)
+            roi_psnr_values.append(roi_psnr)
+            roi_ssim_values.append(
+                ssim_fn(gt_roi, pred_roi, data_range=1.0, channel_axis=2)
+            )
     
-    # Calculate average metrics
-    avg_psnr = np.mean(psnr_values)
-    avg_ssim = np.mean(ssim_values)
-    
-    return {
-        'psnr': avg_psnr,
-        'ssim': avg_ssim,
+    result = {
+        'psnr': np.mean(psnr_values),
+        'ssim': np.mean(ssim_values),
     }
+    if compute_roi:
+        result['roi_psnr'] = np.mean(roi_psnr_values)
+        result['roi_ssim'] = np.mean(roi_ssim_values)
+    return result
