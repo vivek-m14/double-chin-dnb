@@ -18,7 +18,7 @@ import yaml
 # Add src to path for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
-from models.unet import BaseUNetHalf, BaseUNetHalfLite
+from models.unet import BaseUNetHalf, BaseUNetHalfLite, BaseUNetHalfLiteROI
 from utils.utils_blend import load_checkpoint
 
 
@@ -71,6 +71,9 @@ class DoubleChinRemover:
         self.model_variant = model_variant or ckpt_config.get('model_variant', 'default')
         self.last_layer_activation = last_layer_activation or ckpt_config.get('last_layer_activation', 'sigmoid')
         self.blend_scale = blend_scale if blend_scale is not None else ckpt_config.get('blend_scale', 0.5)
+        # ROI crop — auto-detected from checkpoint (only used by Lite variant)
+        self.roi_crop_enabled = ckpt_config.get('roi_crop_enabled', False)
+        self.roi_crop_fraction = ckpt_config.get('roi_crop_fraction', 0.5)
         
         # Set device
         if device == 'auto':
@@ -81,13 +84,14 @@ class DoubleChinRemover:
         # Initialize model
         self.model = self._load_model()
         
+        roi_str = f" | roi_crop: bottom {self.roi_crop_fraction:.0%}" if self.roi_crop_enabled else ""
         print(f"Model: {self.model_variant} | activation: {self.last_layer_activation} "
-              f"| blend_scale: {self.blend_scale} | device: {self.device}")
+              f"| blend_scale: {self.blend_scale} | device: {self.device}{roi_str}")
         
     def _load_model(self):
         """Load the trained model"""
         ModelClass = BaseUNetHalfLite if self.model_variant == 'lite' else BaseUNetHalf
-        model = ModelClass(
+        model_kwargs = dict(
             n_channels=3,  # RGB input
             n_classes=3,
             deep_supervision=False,
@@ -95,6 +99,13 @@ class DoubleChinRemover:
             last_layer_activation=self.last_layer_activation,
             blend_scale=self.blend_scale,
         )
+        if ModelClass is BaseUNetHalfLite and self.roi_crop_enabled:
+            ModelClass = BaseUNetHalfLiteROI
+            model_kwargs['roi_crop_fraction'] = self.roi_crop_fraction
+        elif self.roi_crop_enabled:
+            import warnings
+            warnings.warn("roi_crop_enabled ignored: only supported with model_variant='lite'")
+        model = ModelClass(**model_kwargs)
         
         # Load trained weights (handles DDP prefix stripping)
         model = load_checkpoint(model, self.model_path)
