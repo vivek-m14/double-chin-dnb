@@ -281,30 +281,75 @@ class BaseUNetHalfLite(nn.Module):
             self.apply(weights_init())
 
     def forward(self, x):
-        # Remember original spatial size for the final upscale
         orig_h, orig_w = x.shape[2], x.shape[3]
 
-        # Bilinear downscale (e.g. 1024 → 512)
+        # Bilinear downscale to half resolution
         x = F.interpolate(x, scale_factor=0.5, mode="bilinear", align_corners=True)
 
         # Encoder
-        x1 = self.inc(x)        # 64ch  @ 512
-        x2 = self.down1(x1)     # 128ch @ 256
-        x3 = self.down2(x2)     # 256ch @ 128
-        x4 = self.down3(x3)     # 256ch @ 64
+        x1 = self.inc(x)        # 64ch
+        x2 = self.down1(x1)     # 128ch
+        x3 = self.down2(x2)     # 256ch
+        x4 = self.down3(x3)     # 256ch (bottleneck)
 
         # Decoder
-        x33 = self.up1(x4, x3)  # 128ch @ 128
-        x22 = self.up2(x33, x2) # 64ch  @ 256
-        x11 = self.up3(x22, x1) # 64ch  @ 512
+        x33 = self.up1(x4, x3)  # 128ch
+        x22 = self.up2(x33, x2) # 64ch
+        x11 = self.up3(x22, x1) # 64ch
 
-        x0 = self.outc(x11)     # 3ch   @ 512
+        x0 = self.outc(x11)     # n_classes channels
         x0 = self.last_layer_activation(x0)
 
-        # Bilinear upscale back to original resolution (e.g. 512 → 1024)
+        # Bilinear upscale back to original resolution
         x0 = F.interpolate(x0, size=(orig_h, orig_w), mode="bilinear", align_corners=True)
-
         return x0
+
+
+class BaseUNetHalfLiteROI(BaseUNetHalfLite):
+    """BaseUNetHalfLite with ROI cropping for the chin/edit region.
+
+    Crops the bottom `roi_crop_fraction` of the input before passing to the
+    parent Lite network, then pastes the prediction back into a 0.5-filled
+    (neutral blend) full-size output.  This focuses model capacity on the
+    edit region while maintaining the full output resolution.
+
+    Cropping before the bilinear downscale retains better effective resolution
+    in the edit region compared to processing the full image.
+    """
+
+    def __init__(
+        self, n_channels, n_classes, deep_supervision=False, init_weights=True,
+        last_layer_activation="sigmoid", blend_scale=0.5,
+        roi_crop_fraction=0.5,
+    ):
+        super().__init__(
+            n_channels=n_channels, n_classes=n_classes,
+            deep_supervision=deep_supervision, init_weights=init_weights,
+            last_layer_activation=last_layer_activation, blend_scale=blend_scale,
+        )
+        if not (0.0 < roi_crop_fraction <= 1.0):
+            raise ValueError(
+                f"roi_crop_fraction must be in (0, 1], got {roi_crop_fraction}"
+            )
+        self.roi_crop_fraction = roi_crop_fraction
+
+    def forward(self, x):
+        orig_h, orig_w = x.shape[2], x.shape[3]
+
+        # Crop bottom fraction of the image (chin/edit region)
+        crop_start = int(orig_h * (1.0 - self.roi_crop_fraction))
+        x_roi = x[:, :, crop_start:, :]  # (B, C, crop_h, W)
+
+        # Delegate to parent: bilinear down → UNet → bilinear up
+        roi_out = super().forward(x_roi)
+
+        # Paste into a 0.5-filled (neutral blend) full-size output
+        out = torch.full(
+            (x.shape[0], roi_out.shape[1], orig_h, orig_w),
+            0.5, dtype=roi_out.dtype, device=roi_out.device,
+        )
+        out[:, :, crop_start:, :] = roi_out
+        return out
 
 
 if __name__ == "__main__":
@@ -329,6 +374,19 @@ if __name__ == "__main__":
     out_lite = model_lite(x)
     print(f"  Input      : {x.shape}")
     print(f"  Output     : {out_lite.shape}")
+
+    print()
+    print("=" * 60)
+    print("BaseUNetHalfLiteROI (bottom 50%)")
+    print("=" * 60)
+    model_roi = BaseUNetHalfLiteROI(n_channels=3, n_classes=3, roi_crop_fraction=0.5)
+    num_params_roi = sum(p.numel() for p in model_roi.parameters())
+    print(f"  Parameters : {num_params_roi:,}  ({num_params_roi * 4 / 1024 / 1024:.1f} MB) (same as Lite)")
+    out_roi = model_roi(x)
+    print(f"  Input      : {x.shape}")
+    print(f"  Output     : {out_roi.shape}")
+    print(f"  Top half mean (should be 0.5): {out_roi[:, :, :512, :].mean().item():.6f}")
+    print(f"  Bottom half range: [{out_roi[:, :, 512:, :].min().item():.4f}, {out_roi[:, :, 512:, :].max().item():.4f}]")
 
     print()
     reduction = (1 - num_params_lite / num_params) * 100
