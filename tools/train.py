@@ -81,6 +81,9 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
         if local_rank == 0:
             train_bar.set_postfix(Loss=loss.item())
 
+    # Synchronise all ranks before cross-rank reduction
+    dist.barrier()
+
     # Reduce losses across all processes
     for key in running_losses:
         loss_tensor = torch.tensor(running_losses[key]).to(device)
@@ -164,6 +167,9 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
                 if not os.path.exists(vis_save_dir):
                     os.makedirs(vis_save_dir)
                 save_visualization_batch(batch_for_vis, pred_tensor_maps, vis_save_dir, prefix=f"test_{batch_idx}", max_samples=15)
+
+    # Synchronise all ranks before cross-rank reduction
+    dist.barrier()
 
     # Reduce losses and metrics across all processes
     for key in running_losses:
@@ -372,6 +378,8 @@ def main_worker(local_rank, world_size, args):
     # Set environment variables for distributed training
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = str(args['port'])
+    os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+    os.environ.setdefault('NCCL_DEBUG', 'WARN')
     
     # Initialize process group with timeout
     try:

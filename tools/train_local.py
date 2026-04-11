@@ -36,7 +36,7 @@ from tqdm import tqdm
 
 # ── Project imports ──
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.models.unet import BaseUNetHalf, BaseUNetHalfLite
+from src.models.unet import BaseUNetHalf, BaseUNetHalfLite, BaseUNetHalfLiteROI
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
 from src.utils.utils_blend import load_checkpoint, save_visualization_batch, compute_metrics, save_full_checkpoint, load_full_checkpoint, get_git_sha, CSVMetricsLogger
@@ -154,11 +154,14 @@ def validate(
     epoch: int,
     num_epochs: int,
     save_dir: str | None = None,
+    args: dict | None = None,
 ) -> dict:
     model.eval()
     running = {k: 0.0 for k in ("total_loss", "blend_map_loss", "blend_masked_loss", "blend_unmasked_loss",
                                    "image_mse_loss", "perc_loss", "tv_loss")}
-    running_psnr = 0.0
+    running_metrics = {"psnr": 0.0, "ssim": 0.0, "roi_psnr": 0.0, "roi_ssim": 0.0}
+    args = args or {}
+    roi_crop_fraction = args.get("roi_crop_fraction", 0.5)
 
     bar = tqdm(loader, desc=f"Val   [{epoch+1}/{num_epochs}]", leave=False)
     for batch_idx, batch in enumerate(bar):
@@ -169,11 +172,12 @@ def validate(
         pred_bm = model(images)
         retouched = apply_blend_formula(images, pred_bm)
         loss, losses = criterion(pred_bm, target_bm, retouched, gt)
-        metrics = compute_metrics(retouched, gt)
+        metrics = compute_metrics(retouched, gt, roi_crop_fraction=roi_crop_fraction)
 
         for k in running:
             running[k] += losses.get(k, 0.0)
-        running_psnr += metrics.get("psnr", 0.0)
+        for k in running_metrics:
+            running_metrics[k] += metrics.get(k, 0.0)
         bar.set_postfix(loss=f"{loss.item():.4f}")
 
         # Save visualizations for first few batches
@@ -190,7 +194,8 @@ def validate(
 
     n = len(loader)
     result = {k: v / n for k, v in running.items()}
-    result["psnr"] = running_psnr / n
+    for k in running_metrics:
+        result[k] = running_metrics[k] / n
     return result
 
 
@@ -213,15 +218,21 @@ def train(args: dict):
 
     # ── Model ──
     ModelClass = BaseUNetHalfLite if args.get('model_variant', 'default') == 'lite' else BaseUNetHalf
-    model = ModelClass(
+    model_kwargs = dict(
         n_channels=3, n_classes=3,
         last_layer_activation=args.get('last_layer_activation', 'sigmoid'),
         blend_scale=args.get('blend_scale', 0.5),
-    ).to(device)
+    )
+    if ModelClass is BaseUNetHalfLite and args.get('roi_crop_enabled', False):
+        ModelClass = BaseUNetHalfLiteROI
+        model_kwargs['roi_crop_fraction'] = args.get('roi_crop_fraction', 0.5)
+    model = ModelClass(**model_kwargs).to(device)
     model_config = {
         'model_variant': args.get('model_variant', 'default'),
         'last_layer_activation': args.get('last_layer_activation', 'sigmoid'),
         'blend_scale': args.get('blend_scale', 0.5),
+        'roi_crop_enabled': args.get('roi_crop_enabled', False),
+        'roi_crop_fraction': args.get('roi_crop_fraction', 0.5),
     }
     params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {params:,} ({params/1e6:.1f}M)")
@@ -262,8 +273,14 @@ def train(args: dict):
     best_epoch = -1
     start_epoch = args.get("start_epoch", 0)
     resume_path = args.get("resume_path", "")
-    if resume_path and os.path.isfile(resume_path):
-        ckpt = load_full_checkpoint(resume_path, model, optimizer, scheduler, device=str(device))
+    if resume_path:
+        abs_resume = os.path.abspath(resume_path)
+        if not os.path.isfile(abs_resume):
+            raise FileNotFoundError(
+                f"Cannot resume: checkpoint not found at '{abs_resume}' "
+                f"(raw='{resume_path}', cwd='{os.getcwd()}')"
+            )
+        ckpt = load_full_checkpoint(abs_resume, model, optimizer, scheduler, device=str(device))
         model = ckpt["model"].to(device)
         start_epoch = ckpt["start_epoch"]
         best_val_loss = ckpt["best_val_loss"]
@@ -310,16 +327,19 @@ def train(args: dict):
         vis_dir = save_dir if is_vis_epoch else None
 
         train_losses = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch, num_epochs)
-        val_results = validate(model, val_loader, criterion, device, epoch, num_epochs, vis_dir)
+        val_results = validate(model, val_loader, criterion, device, epoch, num_epochs, vis_dir, args=args)
 
         elapsed = time.time() - t0
         eta = (num_epochs - epoch - 1) * elapsed
 
+        roi_str = ""
+        if val_results.get("roi_psnr", 0) > 0:
+            roi_str = f" | roi_psnr={val_results['roi_psnr']:.1f} roi_ssim={val_results['roi_ssim']:.4f}"
         print(
             f"Epoch {epoch+1}/{num_epochs} | "
             f"train_loss={train_losses['total_loss']:.4f} | "
             f"val_loss={val_results['total_loss']:.4f} | "
-            f"psnr={val_results['psnr']:.1f} | "
+            f"psnr={val_results['psnr']:.1f} ssim={val_results['ssim']:.4f}{roi_str} | "
             f"lr={optimizer.param_groups[0]['lr']:.2e} | "
             f"{elapsed:.0f}s | ETA {datetime.timedelta(seconds=int(eta))}"
         )

@@ -22,7 +22,7 @@ import traceback
 
 # Add the parent directory to the path so we can import from src
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from src.models.unet import BaseUNetHalf, BaseUNetHalfLite
+from src.models.unet import BaseUNetHalf, BaseUNetHalfLite, BaseUNetHalfLiteROI
 from src.data.dataset import create_data_loaders
 from src.losses.losses import CombinedLoss
 from src.blend.blend_map import apply_blend_formula
@@ -121,6 +121,12 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
         if local_rank == 0:
             train_bar.set_postfix(Loss=loss.item())
 
+    # Synchronise all ranks before cross-rank reduction.
+    # If any rank crashed inside the loop (OOM, data error) this barrier
+    # will surface the error within the NCCL timeout instead of hanging
+    # silently in the reduce calls below.
+    dist.barrier()
+
     # Reduce losses across all processes
     for key in running_losses:
         loss_tensor = torch.tensor(running_losses[key]).to(device)
@@ -138,7 +144,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
     return running_losses
 
 
-def validate(model, test_loader, criterion, device, local_rank, world_size, epoch, num_epochs, save_dir=None):
+def validate(model, test_loader, criterion, device, local_rank, world_size, epoch, num_epochs, save_dir=None, args=None):
     """
     Validate the model.
     
@@ -160,8 +166,12 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
     running_losses = {'total_loss': 0.0, 'blend_map_loss': 0.0,
                     'blend_masked_loss': 0.0, 'blend_unmasked_loss': 0.0,
                     'image_mse_loss': 0.0, 'perc_loss': 0.0, 'tv_loss': 0.0}
-    running_metrics = {'psnr': 0.0, 'ssim': 0.0}
-    
+    running_metrics = {'psnr': 0.0, 'ssim': 0.0, 'roi_psnr': 0.0, 'roi_ssim': 0.0}
+    args = args or {}
+    # Always compute ROI metrics on bottom 50% (the chin region) for
+    # consistent tracking regardless of whether ROI crop training is enabled.
+    roi_crop_fraction = args.get('roi_crop_fraction', 0.5)
+
     if local_rank == 0:
         test_bar = tqdm(enumerate(test_loader), total=len(test_loader), 
                        desc=f"Testing Epoch [{epoch + 1}/{num_epochs}]")
@@ -192,8 +202,8 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
             # Calculate combined loss
             loss, losses_dict = criterion(pred_blend_maps, target_blend_maps, retouched_images, gt_images)
 
-            # Calculate metrics
-            metrics = compute_metrics(retouched_images, gt_images)
+            # Calculate metrics (full-image + ROI)
+            metrics = compute_metrics(retouched_images, gt_images, roi_crop_fraction=roi_crop_fraction)
             
             # Update running losses and metrics
             for key in running_losses:
@@ -211,6 +221,9 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
                 if not os.path.exists(vis_save_dir):
                     os.makedirs(vis_save_dir)
                 save_visualization_batch(batch_for_vis, pred_blend_maps, vis_save_dir, prefix=f"test_{batch_idx}", max_samples=15)
+
+    # Synchronise all ranks before cross-rank reduction
+    dist.barrier()
 
     # Reduce losses and metrics across all processes
     for key in running_losses:
@@ -290,9 +303,10 @@ def train_skin_retouching_model(local_rank, world_size, args):
     logger.info(f"Process {local_rank}: Creating data loaders")
     # On resume, load the saved data fingerprint for drift detection
     resume_path = args.get('resume_path', '')
-    if resume_path and os.path.isfile(resume_path):
+    if resume_path:
+        abs_resume = os.path.abspath(resume_path)
         saved_cfg_path = os.path.join(
-            os.path.dirname(os.path.abspath(resume_path)), 'config.yaml'
+            os.path.dirname(abs_resume), 'config.yaml'
         )
         if os.path.isfile(saved_cfg_path):
             with open(saved_cfg_path, 'r') as _f:
@@ -310,18 +324,29 @@ def train_skin_retouching_model(local_rank, world_size, args):
     logger.info(f"Process {local_rank}: Creating model")
     # Create model
     ModelClass = BaseUNetHalfLite if args.get('model_variant', 'default') == 'lite' else BaseUNetHalf
-    model = ModelClass(
+    model_kwargs = dict(
         n_channels=3, n_classes=3,
         last_layer_activation=args.get('last_layer_activation', 'sigmoid'),
         blend_scale=args.get('blend_scale', 0.5),
     )
+    # ROI crop — use dedicated subclass
+    if ModelClass is BaseUNetHalfLite and args.get('roi_crop_enabled', False):
+        ModelClass = BaseUNetHalfLiteROI
+        model_kwargs['roi_crop_fraction'] = args.get('roi_crop_fraction', 0.5)
+    elif args.get('roi_crop_enabled', False):
+        logger.warning("roi_crop_enabled=True ignored: only supported with model_variant='lite'")
+    model = ModelClass(**model_kwargs)
     model = model.to(device)
     model_config = {
         'model_variant': args.get('model_variant', 'default'),
         'last_layer_activation': args.get('last_layer_activation', 'sigmoid'),
         'blend_scale': args.get('blend_scale', 0.5),
+        'roi_crop_enabled': args.get('roi_crop_enabled', False),
+        'roi_crop_fraction': args.get('roi_crop_fraction', 0.5),
     }
     logger.info(f"Process {local_rank}: Model created and moved to device")
+    if args.get('roi_crop_enabled', False):
+        logger.info(f"ROI crop ENABLED: bottom {args.get('roi_crop_fraction', 0.5):.0%} of input")
 
     # get number of parameters and size in MB
     num_params = sum(p.numel() for p in model.parameters())
@@ -379,8 +404,20 @@ def train_skin_retouching_model(local_rank, world_size, args):
     best_ssim_epoch = -1
     start_epoch = args.get('start_epoch', 0)
     resume_path = args.get('resume_path', '')
-    if resume_path and os.path.isfile(resume_path):
-        ckpt = load_full_checkpoint(resume_path, model, optimizer, scheduler, device=str(device))
+    if resume_path:
+        abs_resume = os.path.abspath(resume_path)
+        if not os.path.isfile(abs_resume):
+            logger.error(
+                f"resume_path is set but file NOT FOUND!\n"
+                f"  resume_path (raw):      {resume_path}\n"
+                f"  resume_path (resolved):  {abs_resume}\n"
+                f"  cwd:                     {os.getcwd()}"
+            )
+            raise FileNotFoundError(
+                f"Cannot resume: checkpoint not found at '{abs_resume}' "
+                f"(raw='{resume_path}', cwd='{os.getcwd()}')"
+            )
+        ckpt = load_full_checkpoint(abs_resume, model, optimizer, scheduler, device=str(device))
         model = ckpt['model'].to(device)
         start_epoch = ckpt['start_epoch']
         best_test_loss = ckpt['best_val_loss']
@@ -449,6 +486,15 @@ def train_skin_retouching_model(local_rank, world_size, args):
         # Set epoch for samplers
         epoch_start_time = time.time()
         train_sampler.set_epoch(epoch)
+
+        # Log GPU memory to catch creeping OOM before it crashes a rank
+        if torch.cuda.is_available():
+            alloc_mb = torch.cuda.memory_allocated(device) / (1024 ** 2)
+            reserved_mb = torch.cuda.memory_reserved(device) / (1024 ** 2)
+            logger.info(
+                f"[Rank {local_rank}] Epoch {epoch+1} start — "
+                f"GPU mem: {alloc_mb:.0f} MB alloc / {reserved_mb:.0f} MB reserved"
+            )
         
         # Only save visualizations every save_interval epochs (and first + last)
         is_vis_epoch = (epoch == start_epoch) or ((epoch + 1) % save_interval == 0) or (epoch + 1 == num_epochs)
@@ -491,7 +537,7 @@ def train_skin_retouching_model(local_rank, world_size, args):
         # Validate
         test_results = validate(
             model, test_loader, criterion, device, local_rank, 
-            world_size, epoch, num_epochs, vis_dir
+            world_size, epoch, num_epochs, vis_dir, args=args
         )
         
         # Log validation results
@@ -500,6 +546,8 @@ def train_skin_retouching_model(local_rank, world_size, args):
             logger.info(f"  Average Testing Loss: {test_results['total_loss']:.4f}")
             logger.info(f"  Average PSNR: {test_results['psnr']:.2f} dB")
             logger.info(f"  Average SSIM: {test_results['ssim']:.4f}")
+            logger.info(f"  ROI PSNR: {test_results.get('roi_psnr', 0):.2f} dB")
+            logger.info(f"  ROI SSIM: {test_results.get('roi_ssim', 0):.4f}")
             
             if mlflow_active:
                 try:
@@ -513,6 +561,8 @@ def train_skin_retouching_model(local_rank, world_size, args):
                         'test_tv_loss': test_results['tv_loss'],
                         'test_psnr': test_results['psnr'],
                         'test_ssim': test_results['ssim'],
+                        'test_roi_psnr': test_results.get('roi_psnr', 0),
+                        'test_roi_ssim': test_results.get('roi_ssim', 0),
                     }, step=epoch + 1)
                 except Exception:
                     pass
@@ -636,6 +686,10 @@ def main_worker(local_rank, world_size, args):
     # Set environment variables for distributed training
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = str(args['port'])
+    # NCCL tuning: fail fast on errors instead of hanging for 10 min
+    os.environ.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+    os.environ.setdefault('NCCL_DEBUG', 'WARN')  # set to INFO for full diagnostics
+    os.environ.setdefault('NCCL_BLOCKING_WAIT', '0')
     
     # Initialize process group with timeout
     try:
