@@ -84,6 +84,7 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
                     'blend_masked_loss': 0.0, 'blend_unmasked_loss': 0.0,
                     'image_mse_loss': 0.0, 'perc_loss': 0.0, 'tv_loss': 0.0}
     grad_norms = []  # track per-step gradient norms
+    n_side_face = 0  # count side-face samples (neutral blend map targets)
     
     if local_rank == 0:
         train_bar = tqdm(enumerate(train_loader), total=len(train_loader), 
@@ -96,6 +97,8 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
         images = batch['image'].to(device)
         target_blend_maps = batch['blend_map'].to(device)
         gt_images = batch['gt'].to(device)
+        if 'is_side_face' in batch:
+            n_side_face += batch['is_side_face'].sum().item()
 
         optimizer.zero_grad()
 
@@ -141,6 +144,12 @@ def train_epoch(model, train_loader, optimizer, criterion, device, local_rank, w
         running_losses['grad_norm_max'] = gn.max().item()
         running_losses['grad_clip_ratio'] = (gn > 1.0).float().mean().item()
 
+    # Side face count (reduce across ranks for accurate total)
+    sf_tensor = torch.tensor(n_side_face, dtype=torch.float32).to(device)
+    dist.reduce(sf_tensor, dst=0)
+    if local_rank == 0:
+        running_losses['n_side_face'] = int(sf_tensor.item())
+
     return running_losses
 
 
@@ -171,6 +180,7 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
     # Always compute ROI metrics on bottom 50% (the chin region) for
     # consistent tracking regardless of whether ROI crop training is enabled.
     roi_crop_fraction = args.get('roi_crop_fraction', 0.5)
+    n_side_face = 0  # count side-face samples in validation
 
     if local_rank == 0:
         test_bar = tqdm(enumerate(test_loader), total=len(test_loader), 
@@ -184,6 +194,8 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
             images = batch['image'].to(device)
             target_blend_maps = batch['blend_map'].to(device)
             gt_images = batch['gt'].to(device)
+            if 'is_side_face' in batch:
+                n_side_face += batch['is_side_face'].sum().item()
             
             # Create a new batch dict with device-moved tensors for visualization
             batch_for_vis = {
@@ -237,6 +249,12 @@ def validate(model, test_loader, criterion, device, local_rank, world_size, epoc
         dist.reduce(metric_tensor, dst=0)
         if local_rank == 0:
             running_metrics[key] = metric_tensor.item() / (len(test_loader) * world_size)
+
+    # Side face count (reduce across ranks for accurate total)
+    sf_tensor = torch.tensor(n_side_face, dtype=torch.float32).to(device)
+    dist.reduce(sf_tensor, dst=0)
+    if local_rank == 0:
+        running_metrics['n_side_face'] = int(sf_tensor.item())
 
     # Combine results
     results = {**running_losses, **running_metrics}

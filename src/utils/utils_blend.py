@@ -42,6 +42,8 @@ class CSVMetricsLogger:
         "grad_norm_mean",
         "grad_norm_max",
         "grad_clip_ratio",
+        "n_side_face_train",
+        "n_side_face_val",
         "epoch_time_s",
     ]
 
@@ -113,6 +115,8 @@ class CSVMetricsLogger:
             round(train_losses.get("grad_norm_mean", 0.0), 4),
             round(train_losses.get("grad_norm_max", 0.0), 4),
             round(train_losses.get("grad_clip_ratio", 0.0), 4),
+            int(train_losses.get("n_side_face", 0)),
+            int(val_results.get("n_side_face", 0)),
             round(epoch_time, 1),
         ]
         self._writer.writerow(row)

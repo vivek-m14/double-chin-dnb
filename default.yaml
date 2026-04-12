@@ -31,6 +31,11 @@ pretrained_path: ''      # Path to pretrained model (empty for training from scr
 save_interval: 1         # Save checkpoint every N epochs
 start_epoch: 0           # Starting epoch (useful for resuming training)
 
+# Face pose filtering — force neutral blend maps for side faces
+# Set face_pose_csv to the output of tools/validate_face_pose.py to enable.
+face_pose_csv: ''        # Path to face_pose_scores.csv (empty to disable)
+yaw_threshold: 30        # |yaw| > this (degrees) → neutral blend map target
+
 # Distributed training
 port: 12350
 

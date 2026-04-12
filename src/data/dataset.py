@@ -46,7 +46,7 @@ class BlendMapDataset(Dataset):
     GT_IMAGE = "edited_image"
 
     def __init__(self, data_root, data_json="", resize_dim=(1024, 1024), test=False, augment=True,
-                 data_map=None, **kwargs):
+                 data_map=None, face_pose_yaw=None, yaw_threshold=30.0, **kwargs):
         if kwargs:
             import warnings
             warnings.warn(
@@ -58,6 +58,15 @@ class BlendMapDataset(Dataset):
         self.data_root = data_root
         self.resize_dim = resize_dim
         self.augment = augment
+
+        # Face pose filtering: filename → yaw angle (degrees).
+        # Images with |yaw| > yaw_threshold are treated as side faces:
+        # gt is replaced with original so blend map = 0.5 (neutral).
+        self.face_pose_yaw = face_pose_yaw or {}  # {filename: yaw_degrees}
+        self.yaw_threshold = yaw_threshold
+        if self.face_pose_yaw:
+            logger.info(f"Face pose filtering enabled: {len(self.face_pose_yaw)} images in lookup, "
+                        f"|yaw| > {self.yaw_threshold}° → neutral blend map")
 
         if data_map is not None:
             # Use pre-filtered data_map supplied by create_data_loaders
@@ -128,6 +137,13 @@ class BlendMapDataset(Dataset):
             img_path = os.path.join(self.data_root, img_path)
             gt_path = os.path.join(self.data_root, gt_path)
 
+            # ── Face pose check: is this a side face? ──
+            is_side_face = False
+            if self.face_pose_yaw:
+                yaw = self.face_pose_yaw.get(img_name)
+                if yaw is not None and abs(yaw) > self.yaw_threshold:
+                    is_side_face = True
+
             # Load images as uint8 HWC RGB (Albumentations expects this)
             image = cv2.imread(img_path)
             if image is None:
@@ -135,11 +151,17 @@ class BlendMapDataset(Dataset):
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             image = cv2.resize(image, self.resize_dim)
 
-            gt = cv2.imread(gt_path)
-            if gt is None:
-                raise FileNotFoundError(f"Failed to load image: {gt_path}")
-            gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
-            gt = cv2.resize(gt, self.resize_dim)
+            if is_side_face:
+                # Side face: set gt = original so blend map = 0.5 (neutral).
+                # All losses (blend, perceptual, image MSE) become self-consistent:
+                # the model learns "side face → don't change anything".
+                gt = image.copy()
+            else:
+                gt = cv2.imread(gt_path)
+                if gt is None:
+                    raise FileNotFoundError(f"Failed to load image: {gt_path}")
+                gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
+                gt = cv2.resize(gt, self.resize_dim)
 
             # Augment (same random transform on both image & gt)
             if self.aug is not None:
@@ -158,7 +180,8 @@ class BlendMapDataset(Dataset):
                 'image': image,
                 'blend_map': blend_map,
                 'gt': gt,
-                'filename': img_name
+                'filename': img_name,
+                'is_side_face': is_side_face,
             }
         except Exception as e:
             if retry > 3:
@@ -474,6 +497,20 @@ def _load_ssim_exclusions(ssim_csv: str, exclude_tiers: set) -> set:
     return excluded
 
 
+def _load_face_pose_csv(face_pose_csv: str) -> dict:
+    """Load face pose CSV and return {filename: yaw_degrees} dict.
+
+    The CSV is produced by ``tools/validate_face_pose.py`` and must contain
+    ``filename`` and ``yaw`` columns.
+    """
+    yaw_map: dict = {}
+    with open(face_pose_csv, newline="") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            yaw_map[row["filename"]] = float(row["yaw"])
+    return yaw_map
+
+
 def _filter_data_map(
     data_map: list,
     exclude_sources: list | None = None,
@@ -559,11 +596,25 @@ def create_data_loaders(args, world_size=None, rank=None, dataset_type='blend_ma
     # ------------------------------------------------------------------
     # 2. Create dataset(s) with the curated data_map
     # ------------------------------------------------------------------
+    # ── Face pose yaw lookup (optional) ──
+    face_pose_csv = args.get('face_pose_csv', '')
+    yaw_threshold = args.get('yaw_threshold', 30.0)
+    face_pose_yaw: dict = {}
+    if face_pose_csv and os.path.isfile(face_pose_csv):
+        face_pose_yaw = _load_face_pose_csv(face_pose_csv)
+        n_side = sum(1 for y in face_pose_yaw.values() if abs(y) > yaw_threshold)
+        logger.info(f"Face pose CSV loaded: {len(face_pose_yaw)} entries, "
+                    f"{n_side} side faces (|yaw| > {yaw_threshold}°)")
+    elif face_pose_csv:
+        logger.warning(f"face_pose_csv not found: {face_pose_csv} — face pose filtering disabled")
+
     common_kwargs = dict(
         data_root=args['data_root'],
         data_map=data_map,
         resize_dim=(args['img_size'], args['img_size']),
         test=test,
+        face_pose_yaw=face_pose_yaw,
+        yaw_threshold=yaw_threshold,
     )
 
     if dataset_type == 'blend_map':
